@@ -1,0 +1,45 @@
+{
+  "round_id": 1,
+  "global": {
+    "acc": 0.0103,
+    "loss": 4.672716663360596,
+    "ema_loss": 4.688231547698974,
+    "forget_mean": 0.0010000000474974513,
+    "forget_max": 0.04000000283122063,
+    "divergence": 0.0018513503150668466,
+    "bytes_last_round": 269467488,
+    "bytes_cum": 269467488
+  },
+  "clients": [
+    {
+      "id": 0,
+      "vloss": 4.787148928642273,
+      "vacc": 1.02,
+      "new_batch_size": 22,
+      "replay_capacity": 2000,
+      "last_lr": 0.00012,
+      "last_replay_ratio": 0.5,
+      "last_ewc_lambda": 0.0
+    },
+    {
+      "id": 1,
+      "vloss": 4.780363726615906,
+      "vacc": 1.82,
+      "new_batch_size": 22,
+      "replay_capacity": 2000,
+      "last_lr": 0.00012,
+      "last_replay_ratio": 0.5,
+      "last_ewc_lambda": 0.0
+    },
+    {
+      "id": 2,
+      "vloss": 4.760144066810608,
+      "vacc": 1.42,
+      "new_batch_size": 22,
+      "replay_capacity": 2000,
+      "last_lr": 0.00012,
+      "last_replay_ratio": 0.5,
+      "last_ewc_lambda": 0.0
+    }
+  ]
+}

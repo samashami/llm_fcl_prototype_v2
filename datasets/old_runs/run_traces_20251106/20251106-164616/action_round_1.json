@@ -1,0 +1,33 @@
+{
+  "client_selection_k": 4,
+  "aggregation": {
+    "method": "FedAvg"
+  },
+  "client_params": [
+    {
+      "id": 0,
+      "replay_ratio": 0.5,
+      "lr_scale": 1.0278829632314685,
+      "ewc_lambda": 0.0
+    },
+    {
+      "id": 1,
+      "replay_ratio": 0.5,
+      "lr_scale": 1.0948692117349381,
+      "ewc_lambda": 0.0
+    },
+    {
+      "id": 2,
+      "replay_ratio": 0.5,
+      "lr_scale": 0.8,
+      "ewc_lambda": 0.0
+    },
+    {
+      "id": 3,
+      "replay_ratio": 0.5,
+      "lr_scale": 1.2,
+      "ewc_lambda": 0.0
+    }
+  ],
+  "policy_source": "ControllerV4"
+}

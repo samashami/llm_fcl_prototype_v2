@@ -1,0 +1,17 @@
+{
+  "schema_version": "1.0",
+  "policy_source": "Mock",
+  "global_aggregation_method": "FedAvg",
+  "fedprox_mu": 0.0,
+  "client_selection_k": 4,
+  "client_params": [
+    {
+      "id": 0,
+      "replay_ratio": 0.05,
+      "ewc_lambda": 0.0,
+      "lr_scale": 1.00
+    }
+  ],
+  "notes": "",
+  "clamp_warnings": []
+}

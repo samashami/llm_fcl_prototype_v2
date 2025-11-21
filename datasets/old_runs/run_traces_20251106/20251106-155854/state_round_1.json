@@ -1,0 +1,55 @@
+{
+  "round_id": 1,
+  "global": {
+    "acc": 0.016,
+    "loss": 4.6260720710754395,
+    "ema_loss": 4.65922420501709,
+    "forget_mean": 0.004999999888241291,
+    "forget_max": 0.38999998569488525,
+    "divergence": 0.0016246222502351324,
+    "bytes_last_round": 359289984,
+    "bytes_cum": 359289984
+  },
+  "clients": [
+    {
+      "id": 0,
+      "vloss": 4.70862078666687,
+      "vacc": 2.5,
+      "new_batch_size": 22,
+      "replay_capacity": 2000,
+      "last_lr": 0.00012,
+      "last_replay_ratio": 0.5,
+      "last_ewc_lambda": 0.0
+    },
+    {
+      "id": 1,
+      "vloss": 4.68238377571106,
+      "vacc": 3.1,
+      "new_batch_size": 22,
+      "replay_capacity": 2000,
+      "last_lr": 0.00012,
+      "last_replay_ratio": 0.5,
+      "last_ewc_lambda": 0.0
+    },
+    {
+      "id": 2,
+      "vloss": 4.659542608261108,
+      "vacc": 2.36,
+      "new_batch_size": 22,
+      "replay_capacity": 2000,
+      "last_lr": 0.00012,
+      "last_replay_ratio": 0.5,
+      "last_ewc_lambda": 0.0
+    },
+    {
+      "id": 3,
+      "vloss": 4.668079781532287,
+      "vacc": 3.44,
+      "new_batch_size": 22,
+      "replay_capacity": 2000,
+      "last_lr": 0.00012,
+      "last_replay_ratio": 0.5,
+      "last_ewc_lambda": 0.0
+    }
+  ]
+}

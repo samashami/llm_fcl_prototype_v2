@@ -1,0 +1,8 @@
+run_id,tag,round,global_acc,lr,replay_ratio,notes
+20251016-090519,controller_v3,0,0.6819,0.0001,0.5,warmup (paper defaults)
+20251016-090519,controller_v3,1,0.5933,0.001,0.25,"policy | boost(Δacc>0) | clamped(lr∈[0.0001,0.001], rep∈[0.2,0.7])"
+20251016-090519,controller_v3,2,0.6575,0.001,0.35,"policy | recover(Δacc<0) | clamped(lr∈[0.0001,0.001], rep∈[0.2,0.7])"
+20251016-090519,controller_v3,3,0.6755,0.001,0.35,"policy | boost(Δacc>0) | clamped(lr∈[0.0001,0.001], rep∈[0.2,0.7])"
+20251016-090519,controller_v3,4,0.6947,0.001,0.39999999999999997,"policy | boost(Δacc>0) | clamped(lr∈[0.0001,0.001], rep∈[0.2,0.7])"
+20251016-090519,controller_v3,5,0.7084,0.001,0.45,"policy | boost(Δacc>0) | clamped(lr∈[0.0001,0.001], rep∈[0.2,0.7])"
+20251016-090519,controller_v3,6,0.72,0.001,0.5,"policy | boost(Δacc>0) | clamped(lr∈[0.0001,0.001], rep∈[0.2,0.7])"

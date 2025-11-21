@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0",
+  "round_id": 0,
+  "global_metrics": {
+    "accuracy": 0.0,
+    "avg_forgetting_rate": 0.0,
+    "comm_bytes_last_round": 0,
+    "wall_time_last_round_sec": 0.0
+  },
+  "client_metrics": [
+    {
+      "id": 0,
+      "local_loss": 0.0,
+      "data_drift_metric": 0.0,
+      "current_replay_ratio": 0.05,
+      "train_size": 0,
+      "val_acc": 0.0,
+      "divergence_to_global": 0.0
+    }
+  ]
+}
