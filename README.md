@@ -83,3 +83,19 @@ This project builds on previous work in:
 **Summary:** The adaptive policy outperforms fixed hyperparameters by **+28.0 pp** at Round 4 (65.8% vs 37.8%), mainly by ramping LR (≈0.008→0.0166) and replay (0.20→0.40).  
 See details in `experiments/results/cifar100_policy_vs_baseline_subset3000_rounds5.md`.
 
+## Policy-LLM Dataset
+
+We collect state/action traces from teacher runs for seeds 42–44:
+
+- `datasets/seed42/actions/action_round_*.json`
+- `datasets/seed42/metrics/state_round_*.json`
+- `datasets/seed43/actions/action_round_*.json`
+- `datasets/seed43/metrics/state_round_*.json`
+- `datasets/seed44/actions/action_round_*.json`
+- `datasets/seed44/metrics/state_round_*.json`
+
+Older exploratory runs (used for analysis but not final SFT) are stored under:
+- `datasets/old_runs/run_traces_20251106/`
+
+These traces are transformed into SFT pairs using
+`experiments/build_sft_jsonl.py` and written to `data/sft_pairs.jsonl`.
