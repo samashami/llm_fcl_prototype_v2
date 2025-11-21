@@ -1,3 +1,9 @@
 .DS_Store
 data/cifar-100-python*
 data/*.tar.gz
+
+# Local fine-tuned models (do NOT push to GitHub)
+models/sft_distilgpt2_v2/
+*.bin
+*.safetensors
+
