@@ -146,7 +146,7 @@ def main():
         warmup_ratio=0.1,
         logging_steps=10,
         save_strategy="epoch",
-        evaluation_strategy="no",
+        eval_strategy="no",
         report_to=[],  # disable wandb etc.
         fp16=False,    # CPU training on Mac
 
