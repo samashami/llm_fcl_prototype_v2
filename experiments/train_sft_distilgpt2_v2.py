@@ -150,7 +150,6 @@ def main():
         report_to=[],  # disable wandb etc.
         fp16=False,    # CPU training on Mac
 
-        no_cuda=True,
         use_mps_device=False,
     )
 
