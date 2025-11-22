@@ -7,3 +7,9 @@ models/sft_distilgpt2_v2/
 *.bin
 *.safetensors
 
+.venv/
+runs/
+__pycache__/
+models/
+data/
+*.pyc
