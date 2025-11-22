@@ -1,3 +1,5 @@
+# experiments/train_sft_distilgpt2_v2.py
+import argparse
 import json
 from pathlib import Path
 
@@ -12,45 +14,38 @@ from transformers import (
 )
 
 
-# ------------ CONFIG ---------------
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-SFT_PATH = BASE_DIR / "datasets" / "sft" / "sft_pairs_v2.jsonl"
-
-MODEL_NAME = "distilgpt2"  # starting base model
-OUTPUT_DIR = BASE_DIR / "models" / "sft_distilgpt2_v2"
-
-MAX_LENGTH = 512
-BATCH_SIZE = 2
-EPOCHS = 3
-LR = 5e-5
-
-
-# ------------ DATASET ---------------
-
 class SFTJsonlDataset(Dataset):
     """
-    Simple dataset: each line is {"prompt": ..., "response": ...}
-    We train on prompt + response as a single sequence.
+    Simple PyTorch dataset for our SFT JSONL:
+      each line: {"prompt": "...", "response": "...", ...}
+
+    We concatenate prompt + response and train the LM to predict the whole sequence.
     """
 
-    def __init__(self, jsonl_path, tokenizer, max_length=512):
-        self.examples = []
+    def __init__(self, jsonl_path: str, tokenizer, max_length: int = 512):
         self.tokenizer = tokenizer
         self.max_length = max_length
 
-        with open(jsonl_path, "r", encoding="utf-8") as f:
+        self.examples = []
+        jsonl_path = Path(jsonl_path)
+        if not jsonl_path.is_file():
+            raise FileNotFoundError(f"JSONL not found: {jsonl_path}")
+
+        with jsonl_path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 obj = json.loads(line)
-                prompt = obj["prompt"]
-                response = obj["response"]
-                text = prompt + "\n\n" + response
+                prompt = obj.get("prompt", "")
+                response = obj.get("response", "")
+                text = prompt + response
                 self.examples.append(text)
 
-        print(f"Loaded {len(self.examples)} SFT examples from {jsonl_path}")
+        if len(self.examples) == 0:
+            raise ValueError(f"No examples found in {jsonl_path}")
+
+        print(f"[SFTJsonlDataset] Loaded {len(self.examples)} examples from {jsonl_path}")
 
     def __len__(self):
         return len(self.examples)
@@ -61,12 +56,14 @@ class SFTJsonlDataset(Dataset):
             text,
             truncation=True,
             max_length=self.max_length,
+            padding="max_length",
             return_tensors="pt",
         )
-        input_ids = enc["input_ids"][0]
-        attention_mask = enc["attention_mask"][0]
+        # Trainer expects tensors, not lists
+        input_ids = enc["input_ids"].squeeze(0)
+        attention_mask = enc["attention_mask"].squeeze(0)
 
-        # causal LM: labels = input_ids
+        # For causal LM, labels are just the input IDs
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -74,57 +71,101 @@ class SFTJsonlDataset(Dataset):
         }
 
 
-# ------------ MAIN TRAINING ---------------
+def parse_args():
+    ap = argparse.ArgumentParser(description="SFT DistilGPT2 on controller traces (JSONL v2)")
+    ap.add_argument(
+        "--jsonl",
+        type=str,
+        default="datasets/sft/sft_pairs_v2.jsonl",
+        help="Path to SFT JSONL data",
+    )
+    ap.add_argument(
+        "--output_dir",
+        type=str,
+        default="models/sft_distilgpt2_v2",
+        help="Where to save fine-tuned model",
+    )
+    ap.add_argument(
+        "--num_train_epochs",
+        type=int,
+        default=12,
+        help="Number of training epochs",
+    )
+    ap.add_argument(
+        "--batch_size",
+        type=int,
+        default=8,
+        help="Per-device train batch size",
+    )
+    ap.add_argument(
+        "--lr",
+        type=float,
+        default=5e-5,
+        help="Learning rate",
+    )
+    ap.add_argument(
+        "--max_length",
+        type=int,
+        default=512,
+        help="Max sequence length",
+    )
+    return ap.parse_args()
+
 
 def main():
-    print(f"Using SFT dataset: {SFT_PATH}")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    # GPT-2 family sometimes has no pad token -> set to eos
+    args = parse_args()
+
+    jsonl_path = Path(args.jsonl)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"[train] Loading tokenizer and base model (distilgpt2)...")
+    tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
     if tokenizer.pad_token is None:
+        # GPT2-like models have no pad token by default
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME)
+    model = AutoModelForCausalLM.from_pretrained("distilgpt2")
+    model.resize_token_embeddings(len(tokenizer))
 
-    dataset = SFTJsonlDataset(SFT_PATH, tokenizer, max_length=MAX_LENGTH)
+    # Build dataset (no HuggingFace datasets / pyarrow)
+    train_dataset = SFTJsonlDataset(jsonl_path, tokenizer, max_length=args.max_length)
 
-    # small train/val split (90/10)
-    n = len(dataset)
-    n_train = int(0.9 * n)
-    n_val = n - n_train
-    train_dataset, eval_dataset = torch.utils.data.random_split(
-        dataset,
-        [n_train, n_val],
-        generator=torch.Generator().manual_seed(42),
-    )
-
+    # Training setup
+    # Training setup
     training_args = TrainingArguments(
-        output_dir=str(OUTPUT_DIR),
-        per_device_train_batch_size=BATCH_SIZE,
-        per_device_eval_batch_size=BATCH_SIZE,
-        num_train_epochs=EPOCHS,
-        learning_rate=LR,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
+        output_dir=str(output_dir),
+        overwrite_output_dir=True,
+        num_train_epochs=args.num_train_epochs,
+
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=1,
+
+        learning_rate=args.lr,
+        weight_decay=0.01,
+        warmup_ratio=0.1,
         logging_steps=10,
-        weight_decay=0.0,
-        fp16=torch.cuda.is_available(),
-        report_to=[],
-        save_total_limit=2,
+        save_strategy="epoch",
+        evaluation_strategy="no",
+        report_to=[],  # disable wandb etc.
+        fp16=False,    # CPU training on Mac
+
+        no_cuda=True,
+        use_mps_device=False,
     )
 
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        tokenizer=tokenizer,
     )
 
+    print(f"[train] Starting training on {len(train_dataset)} examples...")
     trainer.train()
-    trainer.save_model(str(OUTPUT_DIR))
-    tokenizer.save_pretrained(str(OUTPUT_DIR))
 
-    print(f"Saved fine-tuned model to: {OUTPUT_DIR}")
+    print(f"[train] Saving fine-tuned model to: {output_dir}")
+    trainer.save_model(str(output_dir))
+    tokenizer.save_pretrained(str(output_dir))
 
 
 if __name__ == "__main__":

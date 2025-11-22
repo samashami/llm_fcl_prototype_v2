@@ -478,11 +478,11 @@ def main():
         # =========================================================
         if args.controller == "sft":
             # SFT: the tiny local LM returns JSON; we validate & clamp it.
-            raw = sft_decide_action(state, model_dir="sft_model_distilgpt2")
-            action = validate_action(raw, n_clients=len(clients), policy_source="SFT_v0")
+            raw = sft_decide_action(state, model_dir="models/sft_distilgpt2_v2")
+            action = validate_action(raw, n_clients=len(clients), policy_source="SFT_v2")
             hp_lr = float(args.lr)
             rep = float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50
-            hp_notes = "SFT_v0"
+            hp_notes = "SFT_v2"
 
         elif args.controller == "mock":
             # Mock: synthetic policy for plumbing / dataset creation
