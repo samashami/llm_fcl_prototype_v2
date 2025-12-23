@@ -13,6 +13,7 @@ from src.model import build_resnet18
 from src.fl import Client, Server
 from src.strategies.replay import ReplayBuffer
 from src.policy import Policy
+from src.policy.lmss_api import lmss_decide_action_api
 from src.agent_io import save_json
 from src.agent_io import write_state_json, write_action_json, validate_action
 from src.mock_agent import decide_action as mock_decide_action
@@ -52,58 +53,112 @@ def _compact_state_for_sft(state):
         vloss = c["vloss"]
         if isinstance(vloss, float) and vloss != vloss:  # NaN
             vloss = None
+        def _safe_float(x):
+            try:
+                x = float(x)
+                # NaN check
+                return None if (x != x) else x
+            except Exception:
+                return None
+
         clients.append({
             "id": int(c["id"]),
-            "vloss": None if vloss is None else float(vloss),
-            "vacc": float(c["vacc"]),
+            "vloss": _safe_float(vloss),
+            "vacc": _safe_float(c.get("vacc")),
             "new_batch_size": int(c["new_batch_size"]),
-            "last_lr": float(c["last_lr"]),
+            "last_lr": _safe_float(c.get("last_lr")),
         })
     return {"global": keep, "clients": clients}
 
-def _balanced_json_from_text(s, anchor="ACTION:\n{"):
-    # take the last occurrence (if any) to be robust
+import re
+
+def _balanced_json_from_text(s, anchor="ACTION:"):
+    """
+    Find JSON after anchor and repair common small-model errors:
+    - missing quotes on keys: {aggregation: -> {"aggregation":
+    - truncated JSON: add missing ] and } when possible
+    """
     if anchor in s:
         s = s.split(anchor)[-1]
-        s = "{" + s
-    depth, end_idx = 0, None
+
+    start_idx = s.find("{")
+    if start_idx == -1:
+        return "{}"
+
+    s = s[start_idx:].strip()
+
+    # Repair 1: add quotes to unquoted keys
+    s = re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', s)
+
+    # Repair 2: find balanced end
+    depth = 0
+    final_idx = len(s)
     for i, ch in enumerate(s):
         if ch == "{":
             depth += 1
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                end_idx = i + 1
+                final_idx = i + 1
                 break
-    return s[:end_idx] if end_idx else "{}"
+
+    candidate = s[:final_idx]
+
+    # Repair 3: if truncated, best-effort close
+    if depth > 0:
+        candidate = candidate.rstrip().rstrip(",")
+        if "[" in candidate and "]" not in candidate:
+            candidate += "]"
+        candidate += ("}" * depth)
+
+    return candidate
 
 _sft_cache = {"tok": None, "mdl": None}
 
 def sft_decide_action(state, model_dir="sft_model_distilgpt2", fewshot=True):
     from transformers import AutoTokenizer, AutoModelForCausalLM
-    import json, torch
 
     # lazy load (keeps it fast across rounds)
     if _sft_cache["tok"] is None:
         tok = AutoTokenizer.from_pretrained(model_dir)
         mdl = AutoModelForCausalLM.from_pretrained(model_dir)
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        mdl = mdl.to(device)
+        print("✅ SFT model device:", next(mdl.parameters()).device, flush=True)
+
         tok.pad_token = tok.eos_token
         _sft_cache["tok"], _sft_cache["mdl"] = tok, mdl
     else:
         tok, mdl = _sft_cache["tok"], _sft_cache["mdl"]
 
     s_small = _compact_state_for_sft(state)
+    num_clients = len(state["clients"])
+
+    instruction = (
+        f"TASK: Output ONE valid JSON object for an ACTION for {num_clients} clients.\n"
+        f"CLIENT IDS: You MUST include exactly one entry for EACH client id 0..{num_clients-1}.\n"
+        "OUTPUT RULES:\n"
+        "- Output ONLY JSON. No text before or after.\n"
+        "- Use ONLY the ACTION schema below.\n"
+        "ACTION SCHEMA:\n"
+        '{ "client_selection_k": <int>, "aggregation": {"method":"FedAvg"}, '
+        '"client_params": ['
+        '{"id":<int>,"replay_ratio":<float>,"lr_scale":<float>,"ewc_lambda":<float>},'
+        ' ... ] }\n'
+        "BOUNDS:\n"
+        "- replay_ratio in [0.0, 0.7]\n"
+        "- lr_scale in [0.5, 1.5]\n"
+        "- ewc_lambda in [0.0, 10.0]\n"
+        "IMPORTANT:\n"
+        "- Do NOT output STATE.\n"
+        "- Do NOT invent new client ids.\n"
+    )
 
     demo = ""
     if fewshot:
         demo = (
-            "You output ONLY one JSON object that matches this schema exactly:\n"
-            '{ "client_selection_k": <int>, "aggregation": {"method":"FedAvg"}, '
-            '"client_params":[{"id":0,"replay_ratio":<float>,"lr_scale":<float>,"ewc_lambda":<float>},'
-            '{"id":1,"replay_ratio":<float>,"lr_scale":<float>,"ewc_lambda":<float>}]} \n'
-            "Bounds: replay_ratio ∈ [0.0,0.7], lr_scale ∈ [0.5,1.5], ewc_lambda ∈ [0.0,10.0].\n"
-            "Do not add explanations.\n\n"
-            "Example:\n"
+            "EXAMPLE:\n"
             'STATE: {"global":{"acc":0.011,"ema_loss":4.73,"forget_mean":0.001,"divergence":0.001},'
             '"clients":[{"id":0,"vloss":4.68,"vacc":1.36,"new_batch_size":45,"last_lr":0.00012},'
             '{"id":1,"vloss":4.67,"vacc":1.34,"new_batch_size":45,"last_lr":0.00012}]}\n'
@@ -113,23 +168,102 @@ def sft_decide_action(state, model_dir="sft_model_distilgpt2", fewshot=True):
             '{"id":1,"replay_ratio":0.5,"lr_scale":1.2,"ewc_lambda":0.0}]}\n\n'
         )
 
-    prompt = demo + f"STATE: {json.dumps(s_small)}\nACTION:\n{{"
+    # Force the model to start JSON immediately:
+    prompt = (
+        instruction + demo +
+        f"STATE: {json.dumps(s_small, allow_nan=False)}\n\n"
+        f"ACTION:\n{{\"client_selection_k\": {num_clients}, "
+        f"\"aggregation\": {{\"method\": \"FedAvg\"}}, "
+        f"\"client_params\": ["
+    )
+
     inputs = tok(prompt, return_tensors="pt")
+    inputs = {k: v.to(mdl.device) for k, v in inputs.items()}
+    
     with torch.no_grad():
-        gen = _sft_cache["mdl"].generate(
+        gen = mdl.generate(
             **inputs,
-            max_new_tokens=180,
+            max_new_tokens=256,
             do_sample=False,
             pad_token_id=tok.eos_token_id,
             eos_token_id=tok.eos_token_id,
         )
-    out_text = tok.decode(gen[0], skip_special_tokens=True)
-    raw_json = _balanced_json_from_text(out_text)
 
+    out_text = tok.decode(gen[0], skip_special_tokens=True)
+
+    # Your prompt contains "ACTION:\n{", so extract from there
+    raw_json = _balanced_json_from_text(out_text, anchor="ACTION:")
+
+    # DEBUG (temporary): write what we saw if parse fails
+    if raw_json == "{}":
+        print(f"\n==== SFT PRODUCED NO JSON ====\nOUT_TEXT_TAIL:\n{out_text[-800:]}\n", flush=True)
+        n_clients = len(state["clients"])
+        return {
+            "client_selection_k": n_clients,
+            "aggregation": {"method": "FedAvg"},
+            "client_params": [
+                {"id": i, "replay_ratio": 0.5, "lr_scale": 1.0, "ewc_lambda": 0.0}
+                for i in range(n_clients)
+            ],
+        }
     try:
-        return json.loads(raw_json)
-    except Exception:
-        return {}
+        act = json.loads(raw_json)
+    except json.JSONDecodeError as e:
+        dump = (
+            "\n==== SFT JSON DECODE FAILED ====\n"
+            f"Error: {e}\n"
+            f"RAW_JSON_HEAD: {raw_json[:400]}\n"
+            f"RAW_JSON_TAIL: {raw_json[-400:]}\n"
+            "\n---- OUT_TEXT_TAIL (last 800 chars) ----\n"
+            f"{out_text[-800:]}\n"
+        )
+        print(dump, flush=True)
+
+        n_clients = len(state["clients"])
+        return {
+            "client_selection_k": n_clients,
+            "aggregation": {"method": "FedAvg"},
+            "client_params": [
+                {"id": i, "replay_ratio": 0.5, "lr_scale": 1.0, "ewc_lambda": 0.0}
+                for i in range(n_clients)
+            ],
+        }
+
+    # =========================
+    # STEP 2.2: sanitize client ids + enforce exact 0..n-1
+    # =========================
+    n_clients = len(state["clients"])
+    params = act.get("client_params", [])
+    by_id = {}
+    for p in params:
+        try:
+            cid = int(p.get("id"))
+        except Exception:
+            continue
+        if 0 <= cid < n_clients and cid not in by_id:
+            by_id[cid] = p
+
+    fixed = []
+    for cid in range(n_clients):
+        p = by_id.get(cid, {"id": cid})
+        fixed.append({
+            "id": cid,
+            "replay_ratio": float(p.get("replay_ratio", 0.5)),
+            "lr_scale": float(p.get("lr_scale", 1.0)),
+            "ewc_lambda": float(p.get("ewc_lambda", 0.0)),
+        })
+
+    act["client_selection_k"] = n_clients
+    act["aggregation"] = {"method": "FedAvg"}
+    act["client_params"] = fixed
+
+    # Your original checks (keep them)
+    if "client_selection_k" not in act:
+        raise RuntimeError(f"SFT action missing client_selection_k: {act}")
+    if "client_params" not in act or not isinstance(act["client_params"], list) or len(act["client_params"]) == 0:
+        raise RuntimeError(f"SFT action has empty/missing client_params: {act}")
+
+    return act
 
 # ---------------------------
 # Seeding helpers
@@ -209,7 +343,7 @@ def main():
     ap.add_argument("--optimizer", choices=["adam","sgd"], default="adam")
     ap.add_argument("--early_patience", type=int, default=5)
     ap.add_argument("--tag", type=str, default="controller_v4")
-    ap.add_argument("--controller", choices=["v4", "mock", "fixed", "sft"], default="v4")
+    ap.add_argument("--controller", choices=["v4", "mock", "fixed", "sft", "lmss_api"], default="v4")
     args = ap.parse_args()
 
     controller_name = {
@@ -217,6 +351,7 @@ def main():
         "mock": "Mock",
         "fixed": "Fixed",
         "sft": "SFT_v0",
+        "lmss_api": "LMSS_API",
     }[args.controller]
     
     set_seeds(args.seed)
@@ -358,9 +493,16 @@ def main():
     server = Server(device=device)
     policy = Policy()
 
+    print("[DEBUG] Before initial FedAvg", flush=True)
+
     # Initial global model + metrics
+    print("[DEBUG] Before initial FedAvg", flush=True)
     global_model = server.average([c.model for c in clients])
+    print("[DEBUG] After initial FedAvg", flush=True)
+
     acc, per_class = evaluate(global_model, device, test_loader)
+    print("[DEBUG] After initial evaluate()", flush=True)
+
     best_recall = per_class.copy()
     forgetting = np.zeros_like(per_class)
     global_loss = evaluate_loss(global_model, device, test_loader)
@@ -478,6 +620,7 @@ def main():
         # =========================================================
         if args.controller == "sft":
             # SFT: the tiny local LM returns JSON; we validate & clamp it.
+            print(f"[DEBUG] Calling SFT controller at round {r}", flush=True)
             raw = sft_decide_action(state, model_dir="models/sft_distilgpt2_v2")
             action = validate_action(raw, n_clients=len(clients), policy_source="SFT_v2")
             hp_lr = float(args.lr)
@@ -492,6 +635,15 @@ def main():
             rep = float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50
             hp_notes = "Mock"
 
+        elif args.controller == "lmss_api":
+            # LMSS via API: LLM selects strategy_id, we expand deterministically
+            raw = lmss_decide_action_api(state, compact_state_fn=_compact_state_for_sft, model="gpt-4o-mini")
+            action = validate_action(raw, n_clients=len(clients), policy_source=raw.get("policy_source", "LMSS_API"))
+            hp_lr = float(args.lr)
+            rep = float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50
+            hp_notes = raw.get("policy_source", "LMSS_API")
+
+
         elif args.controller == "v4":
             # Controller V4: compute hp (lr/rep) from simple signals
             dacc = float(acc - last_acc)
@@ -504,9 +656,11 @@ def main():
                 rep = float(best_hp["replay_ratio"])
                 notes = [f"ROLLBACK(r{rollback_round}→best r{best_round})"]
                 rollback_flag = False
+
             elif r < V4_WARMUP_ROUNDS:
                 lr, rep = float(args.lr), 0.50
                 notes = ["warmup (fixed defaults)"]
+
             else:
                 lr, rep = float(last_hp["lr"]), float(last_hp["replay_ratio"])
                 notes = ["policy_v4"]
@@ -541,6 +695,26 @@ def main():
             vl_min, vl_max = float(np.min(vlosses)), float(np.max(vlosses))
             rng_v = max(1e-8, vl_max - vl_min)
 
+            # --- ✅ WARMUP FIX: force lr_scale=1.0 during warmup rounds ---
+            if r < V4_WARMUP_ROUNDS:
+                lr_scales = [1.0 for _ in clients]
+                notes.append("warmup: lr_scale forced to 1.0")
+            else:
+                lr_scales = [
+                    float(
+                        max(
+                            V4_CLIENT_LR_MIN,
+                            min(
+                                V4_CLIENT_LR_MAX,
+                                V4_CLIENT_LR_MIN
+                                + (1.0 - ((vlosses[i] - vl_min) / rng_v))
+                                * (V4_CLIENT_LR_MAX - V4_CLIENT_LR_MIN),
+                            ),
+                        )
+                    )
+                    for i in range(len(clients))
+                ]
+
             candidate = {
                 "client_selection_k": len(clients),
                 "aggregation": {"method": "FedAvg"},
@@ -548,23 +722,18 @@ def main():
                     {
                         "id": int(c.cid),
                         "replay_ratio": float(rep),
-                        "lr_scale": float(
-                            max(V4_CLIENT_LR_MIN,
-                                min(V4_CLIENT_LR_MAX,
-                                    V4_CLIENT_LR_MIN + (1.0 - ((vlosses[i] - vl_min) / rng_v)) * (V4_CLIENT_LR_MAX - V4_CLIENT_LR_MIN)
-                                )
-                            )
-                        ),
+                        "lr_scale": float(lr_scales[i]),
                         "ewc_lambda": float(getattr(c, "_last_ewc_lambda", 0.0)),
                     }
                     for i, c in enumerate(clients)
                 ],
             }
+
             action = validate_action(candidate, n_clients=len(clients), policy_source="ControllerV4")
             hp_lr = float(lr)
             hp_notes = " | ".join(notes)
-
-        else:
+            
+        elif args.controller == "fixed":
             # fixed (paper CL defaults)
             candidate = {
                 "client_selection_k": len(clients),
@@ -578,6 +747,8 @@ def main():
             hp_lr = float(args.lr)
             rep = 0.50
             hp_notes = "fixed (paper CL default)"
+        else:
+            raise ValueError(f"Unknown controller: {args.controller}")
 
         # =========================================================
         # Apply the validated ACTION uniformly (HP + per-client LR)
