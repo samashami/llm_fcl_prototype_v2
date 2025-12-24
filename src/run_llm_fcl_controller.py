@@ -344,15 +344,19 @@ def main():
     ap.add_argument("--early_patience", type=int, default=5)
     ap.add_argument("--tag", type=str, default="controller_v4")
     ap.add_argument("--controller", choices=["v4", "mock", "fixed", "sft", "lmss_api", "lmss_local"], default="v4")
+    ap.add_argument("--lmss_model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     args = ap.parse_args()
 
-    controller_name = {
+    controller_name_map = {
         "v4": "ControllerV4",
         "mock": "Mock",
         "fixed": "Fixed",
         "sft": "SFT_v0",
         "lmss_api": "LMSS_API",
-    }[args.controller]
+        "lmss_local": "LMSS_LOCAL",
+    }
+
+    controller_name = controller_name_map.get(args.controller, args.controller)
     
     set_seeds(args.seed)
     # safe device selection with fallback for mac (no CUDA)
