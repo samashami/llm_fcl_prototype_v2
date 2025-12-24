@@ -343,7 +343,7 @@ def main():
     ap.add_argument("--optimizer", choices=["adam","sgd"], default="adam")
     ap.add_argument("--early_patience", type=int, default=5)
     ap.add_argument("--tag", type=str, default="controller_v4")
-    ap.add_argument("--controller", choices=["v4", "mock", "fixed", "sft", "lmss_api"], default="v4")
+    ap.add_argument("--controller", choices=["v4", "mock", "fixed", "sft", "lmss_api", "lmss_local"], default="v4")
     args = ap.parse_args()
 
     controller_name = {
@@ -642,6 +642,19 @@ def main():
             hp_lr = float(args.lr)
             rep = float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50
             hp_notes = raw.get("policy_source", "LMSS_API")
+
+        elif args.controller == "lmss_local":
+            from src.policy.lmss_local import lmss_decide_action_local
+
+            raw = lmss_decide_action_local(
+                state,
+                compact_state_fn=_compact_state_for_sft,
+                model_name=getattr(args, "lmss_model", "Qwen/Qwen2.5-0.5B-Instruct"),
+            )
+            action = validate_action(raw, n_clients=len(clients), policy_source=raw.get("policy_source", "LMSS_LOCAL"))
+            hp_lr = float(args.lr)
+            rep = float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50
+            hp_notes = raw.get("policy_source", "LMSS_LOCAL")
 
 
         elif args.controller == "v4":
