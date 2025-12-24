@@ -10,11 +10,11 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # Discrete, safe action space (the “palette”)
 STRATEGY_PALETTE = {
-    0: {"name": "Conservative", "k": 2, "lr_scale": 0.8, "replay_ratio": 0.3, "desc": "Low-impact learning to maintain stability."},
-    1: {"name": "Standard",     "k": 2, "lr_scale": 1.0, "replay_ratio": 0.5, "desc": "Balanced progression."},
-    2: {"name": "Consolidate",  "k": 3, "lr_scale": 0.9, "replay_ratio": 0.7, "desc": "High replay to combat forgetting."},
-    3: {"name": "Aggressive",   "k": 4, "lr_scale": 1.2, "replay_ratio": 0.4, "desc": "Push accuracy with higher LR/K."},
-    4: {"name": "Recover",      "k": 2, "lr_scale": 0.5, "replay_ratio": 0.6, "desc": "Stabilize divergence with lower LR."},
+  0: {"name":"Conservative", "k":2, "lr":1e-4, "lr_scale":0.8, "replay_ratio":0.6},
+  1: {"name":"Standard",     "k":2, "lr":1e-4, "lr_scale":1.0, "replay_ratio":0.5},
+  2: {"name":"Consolidate",  "k":3, "lr":1.5e-4, "lr_scale":1.0, "replay_ratio":0.7},
+  3: {"name":"Aggressive",   "k":4, "lr":3e-4, "lr_scale":1.0, "replay_ratio":0.4},
+  4: {"name":"HyperDrive",   "k":4, "lr":4.5e-4, "lr_scale":1.0, "replay_ratio":0.3},
 }
 
 _DEFAULT_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -43,6 +43,7 @@ def _extract_first_json_object(text: str) -> Optional[Dict[str, Any]]:
 def _build_action_from_strategy(strategy_id: int, n_clients: int) -> Dict[str, Any]:
     strat = STRATEGY_PALETTE.get(int(strategy_id), STRATEGY_PALETTE[1])
     return {
+        "lr": float(strat["lr"]),
         "client_selection_k": int(strat["k"]),
         "aggregation": {"method": "FedAvg"},
         "client_params": [
@@ -88,8 +89,27 @@ def lmss_decide_action_local(
 
     s_small = compact_state_fn(state)
 
+
+    g = state.get("global", {})
+    acc = float(g.get("acc", 0.0))
+    last_acc = float(g.get("last_acc", acc))
+    F_t = float(g.get("forget_mean", 0.0))
+    div = float(g.get("divergence", 0.0))
+    dacc = acc - last_acc
+
+    if div > 0.03:
+        return _build_action_from_strategy(0, n_clients)
+    elif F_t > 0.015:
+        return _build_action_from_strategy(2, n_clients)
+    elif dacc > 0.04 and F_t < 0.01 and div < 0.01:
+        return _build_action_from_strategy(4, n_clients)
+    elif dacc > 0.02 and div < 0.015:
+        return _build_action_from_strategy(3, n_clients)
+    # --------------------------------------------------------------------
+
     palette_text = "\n".join(
-        [f"{k}: {v['name']} — {v['desc']}" for k, v in STRATEGY_PALETTE.items()]
+        [f"{k}: {v['name']} (k={v['k']}, lr={v['lr']}, replay={v['replay_ratio']})"
+        for k, v in STRATEGY_PALETTE.items()]
     )
 
     # Force *tiny* output space: only one integer id + optional short reasoning.

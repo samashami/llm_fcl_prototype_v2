@@ -607,6 +607,7 @@ def main():
             "round_id": int(r),
             "global": {
                 "acc": float(acc),
+                "last_acc": float(last_acc),
                 "loss": float(global_loss),
                 "ema_loss": float(ema_loss),
                 "forget_mean": float(np.mean(forgetting)) if forgetting is not None else 0.0,
@@ -643,7 +644,7 @@ def main():
             # LMSS via API: LLM selects strategy_id, we expand deterministically
             raw = lmss_decide_action_api(state, compact_state_fn=_compact_state_for_sft, model="gpt-4o-mini")
             action = validate_action(raw, n_clients=len(clients), policy_source=raw.get("policy_source", "LMSS_API"))
-            hp_lr = float(args.lr)
+            hp_lr = float(raw.get("lr", args.lr))
             rep = float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50
             hp_notes = raw.get("policy_source", "LMSS_API")
 
@@ -656,7 +657,7 @@ def main():
                 model_name=getattr(args, "lmss_model", "Qwen/Qwen2.5-0.5B-Instruct"),
             )
             action = validate_action(raw, n_clients=len(clients), policy_source=raw.get("policy_source", "LMSS_LOCAL"))
-            hp_lr = float(args.lr)
+            hp_lr = float(raw.get("lr", args.lr))
             rep = float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50
             hp_notes = raw.get("policy_source", "LMSS_LOCAL")
 
