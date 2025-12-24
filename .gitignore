@@ -13,3 +13,15 @@ __pycache__/
 models/
 data/
 *.pyc
+
+# =========================
+# Experiment outputs (DO NOT VERSION)
+# =========================
+fcl_run_results_*.csv
+fcl_run_summary_*.csv
+fcl_run_cl_batches_*.csv
+
+results/
+plots/
+plots_standalone/
+experiments/

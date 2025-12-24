@@ -1,2 +1,0 @@
-run_id,tag,round,global_acc,lr,replay_ratio,notes,global_loss,ema_loss,forget_mean,forget_max,divergence,best_acc_so_far,was_rollback,comm_bytes_round,comm_bytes_cum,aulc_running
-20251223-171946,sanity_v4,0,0.1673,0.0001,0.5,"warmup (fixed defaults) | clamped(lr∈[0.0001,0.002], rep∈[0.20,0.70])",4.245739325714111,4.5434089221191405,0.002099999925121665,0.14000000059604645,0.0010285216315157346,0.1673,False,359289984,359289984,0.1673

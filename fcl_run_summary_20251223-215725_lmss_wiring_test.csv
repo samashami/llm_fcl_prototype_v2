@@ -1,2 +1,0 @@
-run_id,tag,round,global_acc,lr,replay_ratio,notes,global_loss,ema_loss,forget_mean,forget_max,divergence,best_acc_so_far,was_rollback,comm_bytes_round,comm_bytes_cum,aulc_running
-20251223-215725,lmss_wiring_test,0,0.01,0.0001,0.5,LMSS_NO_API_KEY_FALLBACK,4.670981606292725,4.670981606292725,0.0,0.0,0.0018947807312792574,0.01,False,359289984,359289984,0.01

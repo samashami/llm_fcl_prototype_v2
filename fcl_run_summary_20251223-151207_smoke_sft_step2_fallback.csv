@@ -1,2 +1,0 @@
-run_id,tag,round,global_acc,lr,replay_ratio,notes,global_loss,ema_loss,forget_mean,forget_max,divergence,best_acc_so_far,was_rollback,comm_bytes_round,comm_bytes_cum,aulc_running
-20251223-151207,smoke_sft_step2_fallback,0,0.1287,0.0001,0.5,SFT_v2,4.309190545654297,4.562444288101196,0.0018000000854954123,0.12999999523162842,0.0011207784012194429,0.1287,False,359289984,359289984,0.1287
