@@ -35,7 +35,7 @@ V4_EMA_ALPHA     = 0.30
 V4_LR_BOOST      = 1.35
 V4_LR_COOLDOWN   = 1.50
 V4_CLIENT_LR_MIN, V4_CLIENT_LR_MAX = 0.8, 1.2
-V4_ROLLBACK_THR  = 0.02         # absolute acc drop
+V4_ROLLBACK_THR  = 0.015         # allow 1.5% drop before rollback
 V4_WARMUP_ROUNDS = 2
 
 
@@ -577,6 +577,11 @@ def main():
     comm_bytes_cum = 0       # cumulative comm
 
     for r in range(args.rounds):
+
+        # ---- Broadcast global model to all clients (FedAvg step 1) ----
+        for c in clients:
+            c.model.load_state_dict(global_model.state_dict())
+        
         acc_delta = float(acc - last_acc)
 
         # --- Build and write STATE JSON (once, at round start) ---
@@ -871,14 +876,19 @@ def main():
         aulc_running = ((aulc_running * r) + float(acc)) / max(1, (r + 1))
 
         # ---- Rollback check ----
-        if acc < best_global_acc - V4_ROLLBACK_THR:
+        do_rollback = args.controller in ["v4", "lmss_local", "lmss_api", "sft"]
+
+        if do_rollback and (acc < best_global_acc - V4_ROLLBACK_THR):
             global_model.load_state_dict(best_state)
             acc, per_class = evaluate(global_model, device, test_loader)
             forgetting = np.maximum(0.0, best_recall - per_class)
+
             print(
-                f"[🔥 ROLLBACK r{r}] drop detected. Reverted to best (r{best_round}) acc={best_global_acc:.3f}",
+                f"[ROLLBACK r{r}] drop detected. "
+                f"acc={acc:.3f} < best={best_global_acc:.3f} - {V4_ROLLBACK_THR}",
                 flush=True,
             )
+
             rollback_flag = True
             rollback_round = r
         else:
