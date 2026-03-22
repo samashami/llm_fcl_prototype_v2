@@ -14,6 +14,7 @@ from src.fl import Client, Server
 from src.strategies.replay import ReplayBuffer
 from src.policy import Policy
 from src.policy.lmss_api import lmss_decide_action_api
+from src.policy.lmss_openrouter import lmss_decide_action_openrouter
 from src.agent_io import save_json
 from src.agent_io import write_state_json, write_action_json, validate_action
 from src.mock_agent import decide_action as mock_decide_action
@@ -343,7 +344,7 @@ def main():
     ap.add_argument("--optimizer", choices=["adam","sgd"], default="adam")
     ap.add_argument("--early_patience", type=int, default=5)
     ap.add_argument("--tag", type=str, default="controller_v4")
-    ap.add_argument("--controller", choices=["v4", "mock", "fixed", "sft", "lmss_api", "lmss_local"], default="v4")
+    ap.add_argument("--controller", choices=["v4", "mock", "fixed", "sft", "lmss_api", "lmss_local", "lmss_openrouter"], default="v4")
     ap.add_argument("--lmss_model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     args = ap.parse_args()
 
@@ -354,6 +355,7 @@ def main():
         "sft": "SFT_v0",
         "lmss_api": "LMSS_API",
         "lmss_local": "LMSS_LOCAL",
+        "lmss_openrouter": "LMSS_OPENROUTER",
     }
 
     controller_name = controller_name_map.get(args.controller, args.controller)
@@ -666,6 +668,16 @@ def main():
             rep = float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50
             hp_notes = raw.get("policy_source", "LMSS_LOCAL")
 
+        elif args.controller == "lmss_openrouter":
+            raw = lmss_decide_action_openrouter(
+                state,
+                compact_state_fn=_compact_state_for_sft,
+                model=getattr(args, "lmss_model", "openai/gpt-4o-mini"),
+            )
+            action = validate_action(raw, n_clients=len(clients), policy_source=raw.get("policy_source", "LMSS_OPENROUTER"))
+            hp_lr = float(raw.get("lr", args.lr))
+            rep = float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50
+            hp_notes = raw.get("policy_source", "LMSS_OPENROUTER")
 
         elif args.controller == "v4":
             # Controller V4: compute hp (lr/rep) from simple signals
@@ -876,7 +888,7 @@ def main():
         aulc_running = ((aulc_running * r) + float(acc)) / max(1, (r + 1))
 
         # ---- Rollback check ----
-        do_rollback = args.controller in ["v4", "lmss_local", "lmss_api", "sft"]
+        do_rollback = args.controller in ["v4", "lmss_local", "lmss_api", "lmss_openrouter", "sft"]
 
         if do_rollback and (acc < best_global_acc - V4_ROLLBACK_THR):
             global_model.load_state_dict(best_state)
