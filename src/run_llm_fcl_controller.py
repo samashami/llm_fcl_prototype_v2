@@ -497,15 +497,10 @@ def main():
     server = Server(device=device)
     policy = Policy()
 
-    print("[DEBUG] Before initial FedAvg", flush=True)
-
     # Initial global model + metrics
-    print("[DEBUG] Before initial FedAvg", flush=True)
     global_model = server.average([c.model for c in clients])
-    print("[DEBUG] After initial FedAvg", flush=True)
 
     acc, per_class = evaluate(global_model, device, test_loader)
-    print("[DEBUG] After initial evaluate()", flush=True)
 
     best_recall = per_class.copy()
     forgetting = np.zeros_like(per_class)
