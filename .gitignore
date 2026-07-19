@@ -26,5 +26,15 @@ plots/
 plots_standalone/
 experiments/
 
+# Canonical CIFAR-100 paper artifacts are intentionally versioned.
+!experiments/
+experiments/*
+!experiments/results/
+experiments/results/*
+!experiments/results/cifar100/
+experiments/results/cifar100/*
+!experiments/results/cifar100/paper_results/
+!experiments/results/cifar100/paper_results/**
+
 
 OPENROUTER_API_KEY
