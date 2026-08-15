@@ -22,3 +22,22 @@ experimental data.
 
 The files in this directory are preserved experimental outputs. They should
 not be edited in place.
+
+The publication scripts in `plots_paper/Cifar100/` validate the complete set
+of 36 CSVs before loading these summary files. Run the figure scripts and
+`generate_table2.py` from any working directory to regenerate the CIFAR-100
+paper artifacts using repository-relative paths.
+
+From the repository root, run:
+
+```bash
+python plots_paper/Cifar100/plot_fig1_acc_aulc_bar.py
+python plots_paper/Cifar100/plot_fig1_acc_vs_rounds.py
+python plots_paper/Cifar100/plot_fig2_forgetting_vs_rounds.py
+python plots_paper/Cifar100/plot_fig3_aulc_vs_rounds.py
+python plots_paper/Cifar100/plot_fig4_comm_vs_rounds.py
+python plots_paper/Cifar100/generate_table2.py
+```
+
+The scripts write the regenerated PNG figures and `table2.csv`/`table2.tex`
+next to the scripts in `plots_paper/Cifar100/`.
