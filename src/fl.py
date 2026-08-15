@@ -22,7 +22,7 @@ class Client:
     def __init__(self, cid: int, model: nn.Module, optimizer, train_loader,
                  device: Optional[torch.device] = None, replay: Optional[ReplayBuffer] = None,
                  val_loader: Optional[torch.utils.data.DataLoader] = None,
-                 early_patience: int = 5):
+                 early_patience: int = 5, gradient_monitor=None):
         self.cid = cid
         self.device = device or torch.device("cpu")
         self.model = model.to(self.device)                    
@@ -32,6 +32,7 @@ class Client:
         self.replay = replay or ReplayBuffer(capacity=2000)
         self.val_loader = val_loader
         self.early_patience = early_patience
+        self.gradient_monitor = gradient_monitor
         self._best_val = None
         self._no_improve = 0
 
@@ -88,6 +89,8 @@ class Client:
             logits = self.model(x)
             loss = self.criterion(logits, y)
             loss.backward()
+            if self.gradient_monitor is not None:
+                self.gradient_monitor.measure_gradients()
             self.optimizer.step()
 
             running_loss += float(loss.item())

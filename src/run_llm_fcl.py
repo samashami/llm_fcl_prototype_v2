@@ -1,5 +1,5 @@
 # src/run_llm_fcl.py
-import argparse, numpy as np
+import argparse, json, numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from torch import optim
@@ -14,6 +14,7 @@ from src.model import build_resnet18
 from src.fl import Client, Server
 from src.strategies.replay import ReplayBuffer
 from src.policy import Policy
+from src.instrumentation.subspace import SubspaceInstrumentation
 
 # top of file (after imports)
 GLOBAL_SEED = 42
@@ -75,6 +76,12 @@ def main():
     ap.add_argument("--early_patience", type=int, default=5)
     ap.add_argument("--tag", type=str, default="baseline",
                 help="label for this run (used in CSV filenames)")
+    ap.add_argument("--measure_subspaces", action="store_true",
+                    help="enable read-only protected-subspace measurements")
+    ap.add_argument("--subspace_energy", type=float, default=0.95)
+    ap.add_argument("--subspace_max_rank", type=int, default=32)
+    ap.add_argument("--subspace_samples_per_batch", type=int, default=8)
+    ap.add_argument("--subspace_samples_per_phase", type=int, default=64)
     
 
     args = ap.parse_args()
@@ -236,6 +243,19 @@ def main():
     # ✅ Check device
     print("✅ Client 0 model device:", next(clients[0].model.parameters()).device, flush=True)
 
+    subspace_instrumentation = None
+    if args.measure_subspaces:
+        subspace_instrumentation = SubspaceInstrumentation(
+            [c.model for c in clients],
+            explained_energy=args.subspace_energy,
+            max_rank=args.subspace_max_rank,
+            samples_per_batch=args.subspace_samples_per_batch,
+            samples_per_phase=args.subspace_samples_per_phase,
+        )
+        for client, monitor in zip(clients, subspace_instrumentation.monitors):
+            client.gradient_monitor = monitor
+        print("[Subspace] measurement-only instrumentation enabled (lambda=0)", flush=True)
+
 
     # --- server, policy, and initial eval ---
     server = Server(device=device)
@@ -276,6 +296,10 @@ def main():
                 pg["lr"] = hp["lr"]
 
         # --- local continual-learning training ---
+        phase_id = min(r, args.cl_batches - 1)
+        if subspace_instrumentation is not None:
+            subspace_instrumentation.begin_round(phase_id)
+
         for c in clients:
             # Select the current CL batch for this round
             batches = cl_schedule[c.cid]
@@ -332,6 +356,19 @@ def main():
                     )
                     break
 
+        subspace_metrics = {}
+        if subspace_instrumentation is not None:
+            subspace_metrics = subspace_instrumentation.end_round()
+            print(
+                f"[Subspace r={r}] rank={subspace_metrics['protected_basis_rank']} "
+                f"Ein={subspace_metrics['gradient_energy_inside']:.6g} "
+                f"Eout={subspace_metrics['gradient_energy_outside']:.6g} "
+                f"beta_hat={subspace_metrics['beta_hat']:.6g} "
+                f"rho_hat={subspace_metrics['rho_hat']:.6g} "
+                f"overhead={subspace_metrics['measurement_overhead_seconds']:.4f}s",
+                flush=True,
+            )
+
 
         # --- aggregate & evaluate global model ---
         global_model = server.average([c.model for c in clients])
@@ -344,6 +381,29 @@ def main():
             "global_acc": float(acc),
             "lr": hp["lr"],
             "replay_ratio": hp["replay_ratio"],
+            "protected_basis_exists": subspace_metrics.get("protected_basis_exists", False),
+            "protected_basis_rank": subspace_metrics.get("protected_basis_rank", 0),
+            "protected_basis_rank_by_layer": json.dumps(
+                subspace_metrics.get("protected_basis_rank_by_layer", {}), sort_keys=True
+            ),
+            "protected_basis_rank_after_update": subspace_metrics.get(
+                "protected_basis_rank_after_update", 0
+            ),
+            "protected_orthonormality_error": subspace_metrics.get(
+                "protected_orthonormality_error", float("nan")
+            ),
+            "protected_orthonormality_error_by_layer": json.dumps(
+                subspace_metrics.get("protected_orthonormality_error_by_layer", {}), sort_keys=True
+            ),
+            "gradient_energy_inside": subspace_metrics.get("gradient_energy_inside", float("nan")),
+            "gradient_energy_outside": subspace_metrics.get("gradient_energy_outside", float("nan")),
+            "beta_hat": subspace_metrics.get("beta_hat", float("nan")),
+            "rho_hat": subspace_metrics.get("rho_hat", float("nan")),
+            "basis_construction_seconds": subspace_metrics.get("basis_construction_seconds", 0.0),
+            "measurement_overhead_seconds": subspace_metrics.get(
+                "measurement_overhead_seconds", 0.0
+            ),
+            "gradient_measurement_count": subspace_metrics.get("gradient_measurement_count", 0),
         })
         forgetting = np.maximum(0.0, best_recall - per_class)
         best_recall = np.maximum(best_recall, per_class)
@@ -357,6 +417,8 @@ def main():
         f"fcl_run_results_controller_{run_id}.csv,",
         f"fcl_run_summary_controller_{run_id}.csv,",
         f"fcl_run_cl_batches_controller_{run_id}.csv")
+    if subspace_instrumentation is not None:
+        subspace_instrumentation.close()
 
 if __name__ == "__main__":
 

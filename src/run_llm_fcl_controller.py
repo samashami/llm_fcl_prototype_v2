@@ -18,6 +18,7 @@ from src.policy.lmss_openrouter import lmss_decide_action_openrouter
 from src.agent_io import save_json
 from src.agent_io import write_state_json, write_action_json, validate_action
 from src.mock_agent import decide_action as mock_decide_action
+from src.instrumentation.subspace import SubspaceInstrumentation
 import os, json
 # run_llm_fcl_controller.py
 from src._bootstrap_env import *  # sets TOKENIZERS_PARALLELISM=false early
@@ -346,6 +347,12 @@ def main():
     ap.add_argument("--tag", type=str, default="controller_v4")
     ap.add_argument("--controller", choices=["v4", "mock", "fixed", "sft", "lmss_api", "lmss_local", "lmss_openrouter"], default="v4")
     ap.add_argument("--lmss_model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
+    ap.add_argument("--measure_subspaces", action="store_true",
+                    help="enable read-only protected-subspace measurements")
+    ap.add_argument("--subspace_energy", type=float, default=0.95)
+    ap.add_argument("--subspace_max_rank", type=int, default=32)
+    ap.add_argument("--subspace_samples_per_batch", type=int, default=8)
+    ap.add_argument("--subspace_samples_per_phase", type=int, default=64)
     args = ap.parse_args()
 
     controller_name_map = {
@@ -494,6 +501,19 @@ def main():
             print(f"Trainable params: {trainable:,}/{total}", flush=True)
 
     print("✅ Client 0 model device:", next(clients[0].model.parameters()).device, flush=True)
+
+    subspace_instrumentation = None
+    if args.measure_subspaces:
+        subspace_instrumentation = SubspaceInstrumentation(
+            [c.model for c in clients],
+            explained_energy=args.subspace_energy,
+            max_rank=args.subspace_max_rank,
+            samples_per_batch=args.subspace_samples_per_batch,
+            samples_per_phase=args.subspace_samples_per_phase,
+        )
+        for client, monitor in zip(clients, subspace_instrumentation.monitors):
+            client.gradient_monitor = monitor
+        print("[Subspace] measurement-only instrumentation enabled (lambda=0)", flush=True)
 
     # Server / Policy
     server = Server(device=device)
@@ -819,6 +839,10 @@ def main():
         # =========================================================
         # Local training per client
         # =========================================================
+        phase_id = min(r, args.cl_batches - 1)
+        if subspace_instrumentation is not None:
+            subspace_instrumentation.begin_round(phase_id)
+
         for c in clients:
             batches = cl_schedule[c.cid]
             if r < len(batches):
@@ -864,6 +888,19 @@ def main():
                 if stop:
                     print(f"[Client {c.cid}] Early stopping (patience {c.early_patience})", flush=True)
                     break
+
+        subspace_metrics = {}
+        if subspace_instrumentation is not None:
+            subspace_metrics = subspace_instrumentation.end_round()
+            print(
+                f"[Subspace r={r}] rank={subspace_metrics['protected_basis_rank']} "
+                f"Ein={subspace_metrics['gradient_energy_inside']:.6g} "
+                f"Eout={subspace_metrics['gradient_energy_outside']:.6g} "
+                f"beta_hat={subspace_metrics['beta_hat']:.6g} "
+                f"rho_hat={subspace_metrics['rho_hat']:.6g} "
+                f"overhead={subspace_metrics['measurement_overhead_seconds']:.4f}s",
+                flush=True,
+            )
 
         # ---- Divergence (before FedAvg) ----
         with torch.no_grad():
@@ -956,6 +993,33 @@ def main():
             "comm_bytes_round": int(bytes_last_round),
             "comm_bytes_cum": int(bytes_cum),
             "aulc_running": float(aulc_running),
+
+            # measurement-only protected feature subspaces
+            "protected_basis_exists": subspace_metrics.get("protected_basis_exists", False),
+            "protected_basis_rank": subspace_metrics.get("protected_basis_rank", 0),
+            "protected_basis_rank_by_layer": json.dumps(
+                subspace_metrics.get("protected_basis_rank_by_layer", {}), sort_keys=True
+            ),
+            "protected_basis_rank_after_update": subspace_metrics.get(
+                "protected_basis_rank_after_update", 0
+            ),
+            "protected_orthonormality_error": subspace_metrics.get(
+                "protected_orthonormality_error", float("nan")
+            ),
+            "protected_orthonormality_error_by_layer": json.dumps(
+                subspace_metrics.get("protected_orthonormality_error_by_layer", {}), sort_keys=True
+            ),
+            "gradient_energy_inside": subspace_metrics.get("gradient_energy_inside", float("nan")),
+            "gradient_energy_outside": subspace_metrics.get("gradient_energy_outside", float("nan")),
+            "beta_hat": subspace_metrics.get("beta_hat", float("nan")),
+            "rho_hat": subspace_metrics.get("rho_hat", float("nan")),
+            "basis_construction_seconds": subspace_metrics.get(
+                "basis_construction_seconds", 0.0
+            ),
+            "measurement_overhead_seconds": subspace_metrics.get(
+                "measurement_overhead_seconds", 0.0
+            ),
+            "gradient_measurement_count": subspace_metrics.get("gradient_measurement_count", 0),
         })
         
         print(f"[Round {r}] acc={acc:.3f} (best={best_global_acc:.3f})", flush=True)
@@ -970,6 +1034,8 @@ def main():
           f"fcl_run_results_{run_id}_{args.tag}.csv,",
           f"fcl_run_summary_{run_id}_{args.tag}.csv,",
           f"fcl_run_cl_batches_{run_id}_{args.tag}.csv", flush=True)
+    if subspace_instrumentation is not None:
+        subspace_instrumentation.close()
 
 
 if __name__ == "__main__":
