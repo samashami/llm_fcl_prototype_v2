@@ -41,6 +41,51 @@ V4_ROLLBACK_THR  = 0.015         # allow 1.5% drop before rollback
 V4_WARMUP_ROUNDS = 2
 
 
+def make_dirichlet_client_splits(train_indices, targets, n_clients, alpha, seed):
+    """Partition the supplied training indices class-wise across clients."""
+    train_indices = np.asarray(train_indices, dtype=np.int64)
+    targets = np.asarray(targets)
+    if n_clients <= 0:
+        raise ValueError("n_clients must be positive")
+    if alpha <= 0:
+        raise ValueError("alpha must be positive")
+    if len(np.unique(train_indices)) != len(train_indices):
+        raise ValueError("train_indices must not contain duplicates")
+    if len(train_indices) < n_clients:
+        raise ValueError("Dirichlet split requires at least one sample per client")
+
+    rng = np.random.RandomState(seed)
+    train_targets = targets[train_indices]
+
+    # A shuffled DataLoader requires non-empty clients. Redraw only in the rare
+    # event that a client receives no samples; do not otherwise alter the draw.
+    for _ in range(100):
+        splits = [[] for _ in range(n_clients)]
+        for class_id in np.unique(train_targets):
+            class_indices = train_indices[train_targets == class_id].copy()
+            rng.shuffle(class_indices)
+            proportions = rng.dirichlet(np.full(n_clients, alpha))
+            counts = rng.multinomial(len(class_indices), proportions)
+
+            start = 0
+            for client_id, count in enumerate(counts):
+                end = start + count
+                splits[client_id].extend(class_indices[start:end].tolist())
+                start = end
+
+        if all(splits):
+            assigned = np.concatenate(
+                [np.asarray(split, dtype=np.int64) for split in splits]
+            )
+            if len(assigned) != len(train_indices) or not np.array_equal(
+                np.sort(assigned), np.sort(train_indices)
+            ):
+                raise RuntimeError("Dirichlet split did not assign training samples exactly once")
+            return splits
+
+    raise RuntimeError("Could not produce a non-empty Dirichlet split after 100 draws")
+
+
 # --- SFT controller helper (local tiny model) ---
 def _compact_state_for_sft(state):
     g = state["global"]
@@ -338,7 +383,7 @@ def main():
     ap.add_argument("--device", type=str, default="cuda")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log_interval", type=int, default=50)
-    ap.add_argument("--split_mode", choices=["equal"], default="equal")
+    ap.add_argument("--split_mode", choices=["equal", "dirichlet"], default="equal")
     ap.add_argument("--val_size", type=int, default=5000)
     ap.add_argument("--cl_batches", type=int, default=7)
     ap.add_argument("--num_workers", type=int, default=4)
@@ -430,16 +475,39 @@ def main():
 
     print(f"[Split] train={len(train_indices)} val={len(val_indices)} test={len(testset)}", flush=True)
 
-    # Split among clients (equal-size)
-    rng = np.random.RandomState(args.seed)
-    perm = rng.permutation(train_indices)
-    sizes = [len(perm) // args.clients] * args.clients
-    for i in range(len(perm) % args.clients):
-        sizes[i] += 1
-    splits, start = [], 0
-    for s in sizes:
-        splits.append(perm[start:start+s].tolist())
-        start += s
+    # Split among clients
+    if args.split_mode == "equal":
+        rng = np.random.RandomState(args.seed)
+        perm = rng.permutation(train_indices)
+        sizes = [len(perm) // args.clients] * args.clients
+        for i in range(len(perm) % args.clients):
+            sizes[i] += 1
+        splits, start = [], 0
+        for s in sizes:
+            splits.append(perm[start:start+s].tolist())
+            start += s
+    else:
+        splits = make_dirichlet_client_splits(
+            train_indices,
+            trainset_full.targets,
+            n_clients=args.clients,
+            alpha=args.alpha,
+            seed=args.seed,
+        )
+        client_sizes = [len(idxs) for idxs in splits]
+        targets = np.asarray(trainset_full.targets)
+        for i, idxs in enumerate(splits):
+            class_ids, counts = np.unique(targets[idxs], return_counts=True)
+            distribution = dict(zip(class_ids.tolist(), counts.tolist()))
+            print(
+                f"[Split] client {i}: total={len(idxs)} "
+                f"class_distribution={distribution}",
+                flush=True,
+            )
+        print(
+            f"[Split] client sizes: min={min(client_sizes)} max={max(client_sizes)}",
+            flush=True,
+        )
 
     # Optional subsample per client
     if args.subset_per_client and args.subset_per_client > 0:
