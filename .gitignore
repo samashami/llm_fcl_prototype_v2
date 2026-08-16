@@ -38,3 +38,9 @@ experiments/results/cifar100/*
 
 
 OPENROUTER_API_KEY
+
+# LMSS-Geo paper/research artifacts are intentionally versioned.
+!experiments/results/cifar100/lmss_geo/
+!experiments/results/cifar100/lmss_geo/**
+
+.DS_Store
