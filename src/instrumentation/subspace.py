@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from numbers import Real
 import time
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence
 
@@ -30,6 +31,8 @@ DEFAULT_RESNET18_TARGETS = (
     LayerTarget("layer4_1_conv2", "layer4.1.conv2"),
     LayerTarget("fc", "fc"),
 )
+
+SUPPORTED_PROJECTION_LAMBDAS = (0.0, 0.25, 0.5, 0.75, 1.0)
 
 
 class SubspaceBank:
@@ -105,6 +108,44 @@ class SubspaceBank:
             self.bases[name] = torch.linalg.qr(combined, mode="reduced").Q.contiguous()
 
         return time.perf_counter() - started
+
+
+def soft_project_rows(
+    matrix: torch.Tensor, phi: torch.Tensor, lambda_value: float
+) -> torch.Tensor:
+    """Soft-project matrix rows away from the column span of ``phi``."""
+    if not isinstance(matrix, torch.Tensor) or not isinstance(phi, torch.Tensor):
+        raise TypeError("matrix and phi must be torch.Tensor instances")
+    if matrix.ndim != 2:
+        raise ValueError("matrix must be 2-D [output_features, input_features]")
+    if phi.ndim != 2:
+        raise ValueError("phi must be 2-D [input_features, rank]")
+    if phi.numel() == 0 or phi.shape[1] == 0:
+        raise ValueError("phi must contain at least one basis vector")
+    if phi.shape[0] != matrix.shape[1]:
+        raise ValueError(
+            "phi input dimension must match matrix input_features "
+            f"({phi.shape[0]} != {matrix.shape[1]})"
+        )
+    if not matrix.is_floating_point() or not phi.is_floating_point():
+        raise TypeError("matrix and phi must have floating-point dtypes")
+    if matrix.dtype != phi.dtype:
+        raise ValueError("matrix and phi must have the same dtype")
+    if matrix.device != phi.device:
+        raise ValueError("matrix and phi must be on the same device")
+    if (
+        not isinstance(lambda_value, Real)
+        or isinstance(lambda_value, bool)
+        or float(lambda_value) not in SUPPORTED_PROJECTION_LAMBDAS
+    ):
+        raise ValueError(
+            f"lambda_value must be one of {SUPPORTED_PROJECTION_LAMBDAS}"
+        )
+
+    lambda_value = float(lambda_value)
+    if lambda_value == 0.0:
+        return matrix.clone()
+    return matrix - lambda_value * (matrix @ phi) @ phi.T
 
 
 def gradient_energy(
@@ -238,6 +279,36 @@ class _ModelMonitor:
         if measured:
             self.measurements += 1
         self.overhead_seconds += time.perf_counter() - started
+
+    @torch.no_grad()
+    def snapshot_protected_weights(self) -> Dict[str, torch.Tensor]:
+        """Clone weights whose protected bases currently exist."""
+        return {
+            target.name: self.modules[target.name].weight.detach().clone()
+            for target in self.targets
+            if self.bank.basis(target.name) is not None
+        }
+
+    @torch.no_grad()
+    def soft_project_parameter_updates(
+        self, weights_before: Mapping[str, torch.Tensor], lambda_value: float
+    ) -> None:
+        """Replace realized optimizer displacements with soft-projected ones."""
+        for target in self.targets:
+            weight_before = weights_before.get(target.name)
+            if weight_before is None:
+                continue
+            weight = self.modules[target.name].weight
+            displacement = (weight.detach() - weight_before).reshape(weight.shape[0], -1)
+            phi = self.bank.basis(
+                target.name,
+                device=displacement.device,
+                dtype=displacement.dtype,
+            )
+            if phi is None:
+                continue
+            projected = soft_project_rows(displacement, phi, lambda_value)
+            weight.copy_((weight_before.reshape(weight.shape[0], -1) + projected).reshape_as(weight))
 
     def activation_matrices(self) -> Dict[str, torch.Tensor]:
         return {

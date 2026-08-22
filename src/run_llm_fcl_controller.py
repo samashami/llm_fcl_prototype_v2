@@ -398,7 +398,21 @@ def main():
     ap.add_argument("--subspace_max_rank", type=int, default=32)
     ap.add_argument("--subspace_samples_per_batch", type=int, default=8)
     ap.add_argument("--subspace_samples_per_phase", type=int, default=64)
+    ap.add_argument(
+        "--projection_lambda",
+        type=float,
+        choices=[0.0, 0.25, 0.5, 0.75, 1.0],
+        default=0.0,
+    )
     args = ap.parse_args()
+
+    if args.projection_lambda != 0.0:
+        if args.controller != "fixed":
+            ap.error("--projection_lambda > 0 requires --controller fixed")
+        if args.optimizer != "adam":
+            ap.error("--projection_lambda > 0 requires --optimizer adam")
+        if not args.measure_subspaces:
+            ap.error("--projection_lambda > 0 requires --measure_subspaces")
 
     controller_name_map = {
         "v4": "ControllerV4",
@@ -581,7 +595,14 @@ def main():
         )
         for client, monitor in zip(clients, subspace_instrumentation.monitors):
             client.gradient_monitor = monitor
-        print("[Subspace] measurement-only instrumentation enabled (lambda=0)", flush=True)
+        if args.projection_lambda == 0.0:
+            print("[Subspace] measurement-only instrumentation enabled (lambda=0)", flush=True)
+        else:
+            print(
+                f"[Subspace] fixed soft projection enabled "
+                f"(lambda={args.projection_lambda:g})",
+                flush=True,
+            )
 
     # Server / Policy
     server = Server(device=device)
@@ -940,6 +961,7 @@ def main():
                     epoch=e,
                     total_epochs=args.epochs,
                     log_interval=args.log_interval,
+                    projection_lambda=args.projection_lambda,
                 )
                 run_logs.append({
                     "run_id": run_id, "tag": args.tag, "round": r, "client": c.cid,

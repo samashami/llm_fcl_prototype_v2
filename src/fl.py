@@ -66,6 +66,7 @@ class Client:
         epoch: int = 0,
         total_epochs: int = 1,
         log_interval: int = 200,
+        projection_lambda: float = 0.0,
     ):
         self.model.train()
         num_batches = len(self.loader)
@@ -91,7 +92,14 @@ class Client:
             loss.backward()
             if self.gradient_monitor is not None:
                 self.gradient_monitor.measure_gradients()
+            protected_weights = None
+            if projection_lambda != 0.0 and self.gradient_monitor is not None:
+                protected_weights = self.gradient_monitor.snapshot_protected_weights()
             self.optimizer.step()
+            if protected_weights:
+                self.gradient_monitor.soft_project_parameter_updates(
+                    protected_weights, projection_lambda
+                )
 
             running_loss += float(loss.item())
 
