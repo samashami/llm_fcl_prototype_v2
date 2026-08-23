@@ -35,6 +35,8 @@ class Client:
         self.gradient_monitor = gradient_monitor
         self._best_val = None
         self._no_improve = 0
+        self.update_energy_rows = []
+        self._optimizer_step = 0
 
 
     def load_state_from(self, global_model: nn.Module):
@@ -67,6 +69,9 @@ class Client:
         total_epochs: int = 1,
         log_interval: int = 200,
         projection_lambda: float = 0.0,
+        update_control: str = "projection",
+        shrinkage_factors=None,
+        round_id: int = 0,
     ):
         self.model.train()
         num_batches = len(self.loader)
@@ -93,13 +98,44 @@ class Client:
             if self.gradient_monitor is not None:
                 self.gradient_monitor.measure_gradients()
             protected_weights = None
-            if projection_lambda != 0.0 and self.gradient_monitor is not None:
+            projection_active = (
+                update_control == "projection"
+                and projection_lambda != 0.0
+                and self.gradient_monitor is not None
+            )
+            shrinkage_active = (
+                update_control == "shrinkage" and self.gradient_monitor is not None
+            )
+            if projection_active:
                 protected_weights = self.gradient_monitor.snapshot_protected_weights()
+            elif shrinkage_active:
+                protected_weights = self.gradient_monitor.snapshot_target_weights()
             self.optimizer.step()
-            if protected_weights:
-                self.gradient_monitor.soft_project_parameter_updates(
+            if projection_active or shrinkage_active:
+                self._optimizer_step += 1
+            energy_records = []
+            if projection_active and protected_weights:
+                energy_records = self.gradient_monitor.soft_project_parameter_updates(
                     protected_weights, projection_lambda
                 )
+            elif shrinkage_active:
+                if shrinkage_factors is None:
+                    raise ValueError("shrinkage mode requires factors for every protected layer")
+                energy_records = self.gradient_monitor.shrink_parameter_updates(
+                    protected_weights, shrinkage_factors
+                )
+            for record in energy_records:
+                record.update(
+                    {
+                        "round": int(round_id),
+                        "client": int(self.cid),
+                        "epoch": int(epoch + 1),
+                        "batch": int(b),
+                        "local_optimizer_step": int(self._optimizer_step),
+                        "update_control": update_control,
+                    }
+                )
+                self.update_energy_rows.append(record)
 
             running_loss += float(loss.item())
 

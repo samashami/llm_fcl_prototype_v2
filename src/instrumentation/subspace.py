@@ -148,6 +148,112 @@ def soft_project_rows(
     return matrix - lambda_value * (matrix @ phi) @ phi.T
 
 
+def scalar_shrink_rows(matrix: torch.Tensor, factor: float) -> torch.Tensor:
+    """Scale an optimizer displacement without changing its direction."""
+    if not isinstance(matrix, torch.Tensor):
+        raise TypeError("matrix must be a torch.Tensor")
+    if matrix.ndim != 2:
+        raise ValueError("matrix must be 2-D [output_features, input_features]")
+    if not matrix.is_floating_point():
+        raise TypeError("matrix must have a floating-point dtype")
+    if (
+        not isinstance(factor, Real)
+        or isinstance(factor, bool)
+        or not math.isfinite(float(factor))
+        or not 0.0 <= float(factor) <= 1.0
+    ):
+        raise ValueError("shrinkage factor must be a finite value in [0, 1]")
+    return matrix * float(factor)
+
+
+def realized_update_energy(
+    raw_update: torch.Tensor, projected_update: torch.Tensor
+) -> Dict[str, float]:
+    """Account for the realized raw and applied optimizer displacements."""
+    if raw_update.shape != projected_update.shape:
+        raise ValueError("raw and projected updates must have identical shapes")
+    if raw_update.device != projected_update.device:
+        raise ValueError("raw and projected updates must be on the same device")
+    if raw_update.dtype != projected_update.dtype:
+        raise ValueError("raw and projected updates must have the same dtype")
+
+    raw_energy = float(raw_update.detach().square().sum().item())
+    projected_energy = float(projected_update.detach().square().sum().item())
+    removed = raw_update.detach() - projected_update.detach()
+    removed_displacement_energy = float(removed.square().sum().item())
+    raw_norm = math.sqrt(raw_energy)
+    projected_norm = math.sqrt(projected_energy)
+    if raw_energy == 0.0:
+        retained_norm_fraction = float("nan")
+        retained_energy_fraction = float("nan")
+    else:
+        retained_norm_fraction = projected_norm / raw_norm
+        retained_energy_fraction = projected_energy / raw_energy
+    return {
+        "raw_update_norm": raw_norm,
+        "raw_update_energy": raw_energy,
+        "projected_update_norm": projected_norm,
+        "projected_update_energy": projected_energy,
+        "removed_displacement_norm": math.sqrt(removed_displacement_energy),
+        "removed_displacement_energy": removed_displacement_energy,
+        "removed_energy": max(0.0, raw_energy - projected_energy),
+        "retained_norm_fraction": retained_norm_fraction,
+        "retained_energy_fraction": retained_energy_fraction,
+    }
+
+
+def aggregate_update_energy_records(
+    records: Iterable[Mapping[str, object]], rounds: Optional[Iterable[int]] = None
+) -> List[Dict[str, float]]:
+    """Aggregate step/layer energies by round using ratios of energy sums."""
+    grouped: Dict[int, List[Mapping[str, object]]] = {}
+    for record in records:
+        grouped.setdefault(int(record["round"]), []).append(record)
+    if rounds is not None:
+        for round_id in rounds:
+            grouped.setdefault(int(round_id), [])
+
+    result = []
+    energy_fields = (
+        "raw_update_energy",
+        "projected_update_energy",
+        "removed_displacement_energy",
+        "removed_energy",
+    )
+    for round_id in sorted(grouped):
+        rows = grouped[round_id]
+        sums = {
+            f"{field}_sum": sum(float(row[field]) for row in rows)
+            for field in energy_fields
+        }
+        raw = sums["raw_update_energy_sum"]
+        retained = sums["projected_update_energy_sum"]
+        if raw > 0.0:
+            retained_energy_fraction = retained / raw
+            retained_norm_fraction = math.sqrt(retained_energy_fraction)
+            removed_energy_fraction = sums["removed_energy_sum"] / raw
+        else:
+            retained_energy_fraction = float("nan")
+            retained_norm_fraction = float("nan")
+            removed_energy_fraction = float("nan")
+        result.append(
+            {
+                "round": round_id,
+                "step_layer_count": len(rows),
+                **sums,
+                "raw_update_norm": math.sqrt(raw),
+                "projected_update_norm": math.sqrt(retained),
+                "removed_displacement_norm": math.sqrt(
+                    sums["removed_displacement_energy_sum"]
+                ),
+                "retained_norm_fraction": retained_norm_fraction,
+                "retained_energy_fraction": retained_energy_fraction,
+                "removed_energy_fraction": removed_energy_fraction,
+            }
+        )
+    return result
+
+
 def gradient_energy(
     gradient: torch.Tensor, basis: torch.Tensor, eps: float = 1e-12
 ) -> Dict[str, float]:
@@ -290,10 +396,19 @@ class _ModelMonitor:
         }
 
     @torch.no_grad()
+    def snapshot_target_weights(self) -> Dict[str, torch.Tensor]:
+        """Clone all controlled weights without consulting the subspace bank."""
+        return {
+            target.name: self.modules[target.name].weight.detach().clone()
+            for target in self.targets
+        }
+
+    @torch.no_grad()
     def soft_project_parameter_updates(
         self, weights_before: Mapping[str, torch.Tensor], lambda_value: float
-    ) -> None:
+    ) -> List[Dict[str, float]]:
         """Replace realized optimizer displacements with soft-projected ones."""
+        records = []
         for target in self.targets:
             weight_before = weights_before.get(target.name)
             if weight_before is None:
@@ -309,6 +424,48 @@ class _ModelMonitor:
                 continue
             projected = soft_project_rows(displacement, phi, lambda_value)
             weight.copy_((weight_before.reshape(weight.shape[0], -1) + projected).reshape_as(weight))
+            record = realized_update_energy(displacement, projected)
+            record.update(
+                {
+                    "layer": target.name,
+                    "basis_rank": int(phi.shape[1]),
+                    "projection_lambda": float(lambda_value),
+                    "shrinkage_factor": float("nan"),
+                }
+            )
+            records.append(record)
+        return records
+
+    @torch.no_grad()
+    def shrink_parameter_updates(
+        self,
+        weights_before: Mapping[str, torch.Tensor],
+        factors_by_layer: Mapping[str, float],
+    ) -> List[Dict[str, float]]:
+        """Scale realized optimizer displacements without reading any basis."""
+        records = []
+        for target in self.targets:
+            if target.name not in factors_by_layer:
+                raise ValueError(f"missing shrinkage factor for layer {target.name!r}")
+            weight_before = weights_before.get(target.name)
+            if weight_before is None:
+                raise ValueError(f"missing pre-step weight for layer {target.name!r}")
+            weight = self.modules[target.name].weight
+            displacement = (weight.detach() - weight_before).reshape(weight.shape[0], -1)
+            factor = float(factors_by_layer[target.name])
+            shrunk = scalar_shrink_rows(displacement, factor)
+            weight.copy_((weight_before.reshape(weight.shape[0], -1) + shrunk).reshape_as(weight))
+            record = realized_update_energy(displacement, shrunk)
+            record.update(
+                {
+                    "layer": target.name,
+                    "basis_rank": float("nan"),
+                    "projection_lambda": 0.0,
+                    "shrinkage_factor": factor,
+                }
+            )
+            records.append(record)
+        return records
 
     def activation_matrices(self) -> Dict[str, torch.Tensor]:
         return {

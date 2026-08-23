@@ -18,7 +18,12 @@ from src.policy.lmss_openrouter import lmss_decide_action_openrouter
 from src.agent_io import save_json
 from src.agent_io import write_state_json, write_action_json, validate_action
 from src.mock_agent import decide_action as mock_decide_action
-from src.instrumentation.subspace import SubspaceInstrumentation
+from src.instrumentation.subspace import (
+    DEFAULT_RESNET18_TARGETS,
+    SubspaceInstrumentation,
+    aggregate_update_energy_records,
+)
+from src.instrumentation.shrinkage import load_shrinkage_schedule
 import os, json
 # run_llm_fcl_controller.py
 from src._bootstrap_env import *  # sets TOKENIZERS_PARALLELISM=false early
@@ -404,15 +409,34 @@ def main():
         choices=[0.0, 0.25, 0.5, 0.75, 1.0],
         default=0.0,
     )
+    ap.add_argument(
+        "--update_control",
+        choices=["projection", "shrinkage"],
+        default="projection",
+    )
+    ap.add_argument("--shrinkage_schedule", type=str, default=None)
     args = ap.parse_args()
 
-    if args.projection_lambda != 0.0:
+    if args.update_control == "projection" and args.projection_lambda != 0.0:
         if args.controller != "fixed":
             ap.error("--projection_lambda > 0 requires --controller fixed")
         if args.optimizer != "adam":
             ap.error("--projection_lambda > 0 requires --optimizer adam")
         if not args.measure_subspaces:
             ap.error("--projection_lambda > 0 requires --measure_subspaces")
+    if args.update_control == "shrinkage":
+        if args.projection_lambda != 0.0:
+            ap.error("shrinkage mode requires --projection_lambda 0")
+        if args.controller != "fixed":
+            ap.error("shrinkage mode requires --controller fixed")
+        if args.optimizer != "adam":
+            ap.error("shrinkage mode requires --optimizer adam")
+        if not args.measure_subspaces:
+            ap.error("shrinkage mode requires --measure_subspaces")
+        if not args.shrinkage_schedule:
+            ap.error("shrinkage mode requires --shrinkage_schedule")
+    elif args.shrinkage_schedule:
+        ap.error("--shrinkage_schedule is only valid in shrinkage mode")
 
     controller_name_map = {
         "v4": "ControllerV4",
@@ -595,7 +619,9 @@ def main():
         )
         for client, monitor in zip(clients, subspace_instrumentation.monitors):
             client.gradient_monitor = monitor
-        if args.projection_lambda == 0.0:
+        if args.update_control == "shrinkage":
+            print("[Subspace] norm-matched scalar shrinkage enabled", flush=True)
+        elif args.projection_lambda == 0.0:
             print("[Subspace] measurement-only instrumentation enabled (lambda=0)", flush=True)
         else:
             print(
@@ -603,6 +629,24 @@ def main():
                 f"(lambda={args.projection_lambda:g})",
                 flush=True,
             )
+
+    shrinkage_schedule = None
+    if args.update_control == "shrinkage":
+        layer_names = [target.name for target in DEFAULT_RESNET18_TARGETS]
+        expected_keys = (
+            (round_id, client_id, layer_name)
+            for round_id in range(args.rounds)
+            for client_id in range(args.clients)
+            for layer_name in layer_names
+        )
+        shrinkage_schedule = load_shrinkage_schedule(
+            args.shrinkage_schedule, expected_keys
+        )
+        print(
+            f"[Shrinkage] loaded {len(shrinkage_schedule)} frozen schedule entries "
+            f"from {args.shrinkage_schedule}",
+            flush=True,
+        )
 
     # Server / Policy
     server = Server(device=device)
@@ -962,6 +1006,16 @@ def main():
                     total_epochs=args.epochs,
                     log_interval=args.log_interval,
                     projection_lambda=args.projection_lambda,
+                    update_control=args.update_control,
+                    shrinkage_factors=(
+                        {
+                            target.name: shrinkage_schedule[(r, c.cid, target.name)]
+                            for target in DEFAULT_RESNET18_TARGETS
+                        }
+                        if shrinkage_schedule is not None
+                        else None
+                    ),
+                    round_id=r,
                 )
                 run_logs.append({
                     "run_id": run_id, "tag": args.tag, "round": r, "client": c.cid,
@@ -1120,10 +1174,34 @@ def main():
     pd.DataFrame(run_logs).to_csv(f"fcl_run_results_{run_id}_{args.tag}.csv", index=False)
     pd.DataFrame(round_logs).to_csv(f"fcl_run_summary_{run_id}_{args.tag}.csv", index=False)
     pd.DataFrame(cl_rows).to_csv(f"fcl_run_cl_batches_{run_id}_{args.tag}.csv", index=False)
+    update_energy_rows = [
+        {"run_id": run_id, "tag": args.tag, **row}
+        for client in clients
+        for row in client.update_energy_rows
+    ]
+    step_energy_path = f"fcl_run_update_energy_steps_{run_id}_{args.tag}.csv"
+    round_energy_path = f"fcl_run_update_energy_rounds_{run_id}_{args.tag}.csv"
+    if update_energy_rows:
+        pd.DataFrame(update_energy_rows).to_csv(step_energy_path, index=False)
+        round_energy_rows = aggregate_update_energy_records(
+            update_energy_rows, rounds=range(args.rounds)
+        )
+        for row in round_energy_rows:
+            row.update(
+                {
+                    "run_id": run_id,
+                    "tag": args.tag,
+                    "update_control": args.update_control,
+                    "projection_lambda": args.projection_lambda,
+                }
+            )
+        pd.DataFrame(round_energy_rows).to_csv(round_energy_path, index=False)
     print("✓ Wrote CSVs:",
           f"fcl_run_results_{run_id}_{args.tag}.csv,",
           f"fcl_run_summary_{run_id}_{args.tag}.csv,",
           f"fcl_run_cl_batches_{run_id}_{args.tag}.csv", flush=True)
+    if update_energy_rows:
+        print("✓ Wrote update-energy CSVs:", step_energy_path, round_energy_path, flush=True)
     if subspace_instrumentation is not None:
         subspace_instrumentation.close()
 
