@@ -8,6 +8,7 @@ from torch import optim
 from torchvision import datasets, transforms
 import pandas as pd
 import math
+from pathlib import Path
 
 from src.model import build_resnet18
 from src.fl import Client, Server
@@ -24,6 +25,19 @@ from src.instrumentation.subspace import (
     aggregate_update_energy_records,
 )
 from src.instrumentation.shrinkage import load_shrinkage_schedule
+from src.checkpointing import (
+    CHECKPOINT_FORMAT_VERSION,
+    capture_rng_state,
+    endpoint_state,
+    fingerprint_sha256,
+    load_checkpoint,
+    model_state_sha256,
+    protocol_manifest,
+    restore_rng_state,
+    save_checkpoint,
+    verify_endpoint_reference,
+    write_endpoint_reference,
+)
 import os, json
 # run_llm_fcl_controller.py
 from src._bootstrap_env import *  # sets TOKENIZERS_PARALLELISM=false early
@@ -415,7 +429,70 @@ def main():
         default="projection",
     )
     ap.add_argument("--shrinkage_schedule", type=str, default=None)
+    ap.add_argument(
+        "--capture_common_checkpoints",
+        action="store_true",
+        help="save immutable pre-round-1/pre-round-5 checkpoints and parent references",
+    )
+    ap.add_argument("--common_checkpoint_dir", type=str, default=None)
+    ap.add_argument("--resume_checkpoint", type=str, default=None)
+    ap.add_argument(
+        "--one_round",
+        action="store_true",
+        help="execute only the checkpoint's next round, then stop",
+    )
+    ap.add_argument(
+        "--determinism_reference",
+        type=str,
+        default=None,
+        help="parent endpoint JSON required for a resumed lambda=0 branch",
+    )
+    ap.add_argument(
+        "--determinism_gate_dir",
+        type=str,
+        default=None,
+        help="directory containing both lambda=0 PASS reports; required for nonzero branches",
+    )
+    ap.add_argument("--output_dir", type=str, default=".")
     args = ap.parse_args()
+
+    if args.capture_common_checkpoints:
+        if args.controller != "fixed" or args.optimizer != "adam":
+            ap.error("common-checkpoint parent requires fixed controller and Adam")
+        if args.update_control != "projection" or args.projection_lambda != 0.0:
+            ap.error("common-checkpoint parent must use projection mode with lambda=0")
+        if not args.measure_subspaces:
+            ap.error("common-checkpoint parent requires --measure_subspaces")
+        if args.rounds < 6:
+            ap.error("common-checkpoint parent must run through round 5 (--rounds >= 6)")
+        if not args.common_checkpoint_dir:
+            ap.error("--capture_common_checkpoints requires --common_checkpoint_dir")
+    if args.resume_checkpoint:
+        if not args.one_round:
+            ap.error("--resume_checkpoint requires --one_round")
+        if args.controller != "fixed" or args.optimizer != "adam":
+            ap.error("common-checkpoint branches require fixed controller and Adam")
+        if args.update_control != "projection" or not args.measure_subspaces:
+            ap.error("common-checkpoint branches require measured projection mode")
+        if args.projection_lambda == 0.0 and not args.determinism_reference:
+            ap.error("a resumed lambda=0 branch requires --determinism_reference")
+        if args.projection_lambda != 0.0 and not args.determinism_gate_dir:
+            ap.error("nonzero branches require --determinism_gate_dir")
+    elif args.one_round or args.determinism_reference or args.determinism_gate_dir:
+        ap.error(
+            "--one_round/--determinism_reference/--determinism_gate_dir "
+            "require --resume_checkpoint"
+        )
+
+    branching_mode = bool(args.capture_common_checkpoints or args.resume_checkpoint)
+    if branching_mode:
+        torch.use_deterministic_algorithms(True)
+        if args.device in {"cuda", "auto"} and torch.cuda.is_available():
+            if os.environ.get("CUBLAS_WORKSPACE_CONFIG") not in {":4096:8", ":16:8"}:
+                ap.error(
+                    "deterministic CUDA branching requires "
+                    "CUBLAS_WORKSPACE_CONFIG=:4096:8 (set it before Python starts)"
+                )
 
     if args.update_control == "projection" and args.projection_lambda != 0.0:
         if args.controller != "fixed":
@@ -449,6 +526,35 @@ def main():
     }
 
     controller_name = controller_name_map.get(args.controller, args.controller)
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = (
+        Path(args.common_checkpoint_dir)
+        if args.common_checkpoint_dir
+        else output_dir / "checkpoints"
+    )
+    resume_payload = None
+    resume_metadata = None
+    if args.resume_checkpoint:
+        resume_payload, resume_metadata = load_checkpoint(args.resume_checkpoint)
+
+    protocol_fields = (
+        "clients", "alpha", "epochs", "rounds", "batch_size", "lr",
+        "subset_per_client", "seed", "split_mode", "val_size", "cl_batches",
+        "num_workers", "optimizer", "early_patience", "controller",
+        "measure_subspaces", "subspace_energy", "subspace_max_rank",
+        "subspace_samples_per_batch", "subspace_samples_per_phase",
+        "update_control",
+    )
+    protocol = {name: getattr(args, name) for name in protocol_fields}
+    code_paths = (
+        "src/run_llm_fcl_controller.py",
+        "src/checkpointing.py",
+        "src/fl.py",
+        "src/strategies/replay.py",
+        "src/instrumentation/subspace.py",
+    )
     
     set_seeds(args.seed)
     # safe device selection with fallback for mac (no CUDA)
@@ -579,6 +685,25 @@ def main():
         for i, b in enumerate(batches, start=1):
             cl_rows.append({"run_id": "", "client": cid, "cl_batch": i, "size": len(b)})
 
+    data_state = {
+        "train_indices": train_indices.tolist(),
+        "val_indices": val_indices.tolist(),
+        "client_splits": [[int(index) for index in split] for split in splits],
+        "cl_schedule": [
+            [[int(index) for index in batch] for batch in client_batches]
+            for client_batches in cl_schedule
+        ],
+    }
+    if resume_payload is not None:
+        checkpoint_manifest = resume_payload.get("manifest", {})
+        if checkpoint_manifest.get("protocol") != protocol:
+            raise RuntimeError(
+                "resume protocol differs from checkpoint: "
+                f"checkpoint={checkpoint_manifest.get('protocol')}, current={protocol}"
+            )
+        if resume_payload.get("data_state") != data_state:
+            raise RuntimeError("train/validation split, client split, or CL schedule differs")
+
     # Init clients
     clients = []
     for cid, idx in enumerate(splits):
@@ -648,6 +773,30 @@ def main():
             flush=True,
         )
 
+    current_manifest = protocol_manifest(protocol, code_paths) if branching_mode else None
+    if resume_payload is not None:
+        checkpoint_manifest = resume_payload["manifest"]
+        if checkpoint_manifest["code"]["files_sha256"] != current_manifest["code"]["files_sha256"]:
+            raise RuntimeError("checkpoint code-file checksums differ from current code")
+        environment_keys = (
+            "python", "platform", "torch", "numpy", "cuda_runtime", "cudnn",
+            "cuda_device_count", "cuda_devices", "cudnn_deterministic",
+            "cudnn_benchmark", "deterministic_algorithms", "cublas_workspace_config",
+        )
+        environment_differences = {
+            key: {
+                "checkpoint": checkpoint_manifest["environment"].get(key),
+                "current": current_manifest["environment"].get(key),
+            }
+            for key in environment_keys
+            if checkpoint_manifest["environment"].get(key)
+            != current_manifest["environment"].get(key)
+        }
+        if environment_differences:
+            raise RuntimeError(
+                f"checkpoint environment differs from current environment: {environment_differences}"
+            )
+
     # Server / Policy
     server = Server(device=device)
     policy = Policy()
@@ -697,7 +846,7 @@ def main():
 
     run_logs, round_logs = [], []
 
-    io_root = os.path.join("runs", run_id)
+    io_root = str(output_dir / "runs" / run_id)
     os.makedirs(io_root, exist_ok=True)
 
     def _build_state(round_id, acc_global, loss_global, ema_loss, forget_mean, forget_max, divergence, bytes_last_round, client_snapshots):
@@ -731,7 +880,157 @@ def main():
     acc_hist = []            # for AULC
     comm_bytes_cum = 0       # cumulative comm
 
-    for r in range(args.rounds):
+    parent_run_id = run_id
+    start_round = 0
+    source_checkpoint_sha256 = None
+    starting_state_hash = None
+    if resume_payload is not None:
+        global_model.load_state_dict(resume_payload["global_model"])
+        if len(resume_payload["clients"]) != len(clients):
+            raise RuntimeError("checkpoint client count differs")
+        for client, saved in zip(clients, resume_payload["clients"]):
+            if int(saved["cid"]) != int(client.cid):
+                raise RuntimeError("checkpoint client ordering differs")
+            client.optimizer.load_state_dict(saved["optimizer"])
+            client.replay.load_state_dict(saved["replay"])
+            client.load_persistent_state_dict(saved["persistent"])
+            client.update_energy_rows = []
+        subspace_instrumentation.load_state_dict(resume_payload["subspace"])
+
+        metrics = resume_payload["metrics"]
+        acc = metrics["acc"]
+        per_class = metrics["per_class"].copy()
+        best_recall = metrics["best_recall"].copy()
+        forgetting = metrics["forgetting"].copy()
+        global_loss = metrics["global_loss"]
+        ema_loss = metrics["ema_loss"]
+        div_norm = metrics["div_norm"]
+        last_acc = metrics["last_acc"]
+        last_hp = copy.deepcopy(metrics["last_hp"])
+        best_global_acc = metrics["best_global_acc"]
+        best_state = copy.deepcopy(metrics["best_state"])
+        best_hp = copy.deepcopy(metrics["best_hp"])
+        best_round = metrics["best_round"]
+        rollback_flag = metrics["rollback_flag"]
+        rollback_round = metrics["rollback_round"]
+        aulc_running = metrics["aulc_running"]
+        bytes_last_round = metrics["bytes_last_round"]
+        bytes_cum = metrics["bytes_cum"]
+        acc_hist = copy.deepcopy(metrics["acc_hist"])
+        comm_bytes_cum = metrics["comm_bytes_cum"]
+
+        start_round = int(resume_payload["next_round"])
+        if start_round not in {1, 5}:
+            raise RuntimeError(
+                f"common-state branch checkpoint must be pre-round 1 or 5, got {start_round}"
+            )
+        parent_run_id = str(resume_payload["parent_run_id"])
+        source_checkpoint_sha256 = resume_metadata["sha256"]
+        starting_state_hash = resume_metadata["starting_state_hash"]
+        # This must be the final restoration action before the round starts.
+        restore_rng_state(resume_payload["rng"], g)
+        del resume_payload
+        print(
+            f"[Checkpoint] restored parent={parent_run_id} pre-round={start_round} "
+            f"sha256={source_checkpoint_sha256}",
+            flush=True,
+        )
+        if args.projection_lambda == 0.0:
+            reference_document = json.loads(
+                Path(args.determinism_reference).read_text(encoding="utf-8")
+            )
+            reference_identity = {
+                "parent_run_id": reference_document.get("parent_run_id"),
+                "executed_round": reference_document.get("executed_round"),
+                "source_checkpoint_sha256": reference_document.get(
+                    "source_checkpoint_sha256"
+                ),
+            }
+            expected_identity = {
+                "parent_run_id": parent_run_id,
+                "executed_round": start_round,
+                "source_checkpoint_sha256": source_checkpoint_sha256,
+            }
+            if reference_identity != expected_identity:
+                raise RuntimeError(
+                    "determinism reference does not belong to this checkpoint: "
+                    f"expected={expected_identity}, found={reference_identity}"
+                )
+        else:
+            gate_dir = Path(args.determinism_gate_dir)
+            gate_paths = [
+                gate_dir / "determinism_round_01_lambda000_PASS.json",
+                gate_dir / "determinism_round_05_lambda000_PASS.json",
+            ]
+            gate_documents = []
+            for gate_path in gate_paths:
+                if not gate_path.is_file():
+                    raise RuntimeError(
+                        f"nonzero branch blocked: missing determinism gate {gate_path}"
+                    )
+                document = json.loads(gate_path.read_text(encoding="utf-8"))
+                if not document.get("determinism_gate", {}).get("passed", False):
+                    raise RuntimeError(
+                        f"nonzero branch blocked: determinism gate did not pass {gate_path}"
+                    )
+                gate_documents.append(document)
+            if any(doc.get("parent_run_id") != parent_run_id for doc in gate_documents):
+                raise RuntimeError(
+                    "nonzero branch blocked: determinism gates belong to another parent"
+                )
+
+    stop_round = start_round + 1 if args.one_round else args.rounds
+    captured_checkpoint_metadata = {}
+
+    def _metric_state():
+        return {
+            "acc": float(acc),
+            "per_class": per_class.copy(),
+            "best_recall": best_recall.copy(),
+            "forgetting": forgetting.copy(),
+            "global_loss": float(global_loss),
+            "ema_loss": float(ema_loss),
+            "div_norm": float(div_norm),
+            "last_acc": float(last_acc),
+            "last_hp": copy.deepcopy(last_hp),
+            "best_global_acc": float(best_global_acc),
+            "best_state": copy.deepcopy(best_state),
+            "best_hp": copy.deepcopy(best_hp),
+            "best_round": int(best_round),
+            "rollback_flag": bool(rollback_flag),
+            "rollback_round": int(rollback_round),
+            "aulc_running": float(aulc_running),
+            "bytes_last_round": int(bytes_last_round),
+            "bytes_cum": int(bytes_cum),
+            "acc_hist": copy.deepcopy(acc_hist),
+            "comm_bytes_cum": int(comm_bytes_cum),
+        }
+
+    def _checkpoint_payload(next_round):
+        return {
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "next_round": int(next_round),
+            "parent_run_id": parent_run_id,
+            "global_model": copy.deepcopy(global_model.state_dict()),
+            "clients": [
+                {
+                    "cid": int(client.cid),
+                    "optimizer": copy.deepcopy(client.optimizer.state_dict()),
+                    "replay": client.replay.state_dict(),
+                    "persistent": client.persistent_state_dict(),
+                    # Local weights are discarded by the next-round broadcast.
+                    "local_model_hash": model_state_sha256(client.model.state_dict()),
+                }
+                for client in clients
+            ],
+            "subspace": subspace_instrumentation.state_dict(),
+            "metrics": _metric_state(),
+            "rng": capture_rng_state(g),
+            "data_state": data_state,
+            "manifest": current_manifest,
+        }
+
+    for r in range(start_round, stop_round):
 
         # ---- Broadcast global model to all clients (FedAvg step 1) ----
         for c in clients:
@@ -1168,23 +1467,129 @@ def main():
         
         print(f"[Round {r}] acc={acc:.3f} (best={best_global_acc:.3f})", flush=True)
 
+        deterministic_summary = {
+            key: value
+            for key, value in round_logs[-1].items()
+            if key not in {
+                "run_id",
+                "tag",
+                # Wall-clock observations cannot be bitwise reproducible and
+                # do not affect continuation semantics.
+                "basis_construction_seconds",
+                "measurement_overhead_seconds",
+            }
+        }
+        endpoint = (
+            endpoint_state(
+                global_model,
+                clients,
+                subspace_instrumentation,
+                deterministic_summary,
+                history_state=_metric_state(),
+                rng_state=capture_rng_state(g),
+            )
+            if branching_mode
+            else None
+        )
+
+        if args.capture_common_checkpoints and r in {1, 5}:
+            reference_path = checkpoint_dir / f"parent_endpoint_round_{r:02d}.json"
+            source = captured_checkpoint_metadata[r]
+            reference = write_endpoint_reference(
+                reference_path,
+                endpoint,
+                {
+                    "parent_run_id": parent_run_id,
+                    "executed_round": int(r),
+                    "projection_lambda": 0.0,
+                    "source_checkpoint": source["checkpoint"],
+                    "source_checkpoint_sha256": source["sha256"],
+                    "excluded_nondeterministic_summary_fields": [
+                        "basis_construction_seconds",
+                        "measurement_overhead_seconds",
+                    ],
+                },
+            )
+            print(
+                f"[Checkpoint] wrote parent endpoint reference {reference_path} "
+                f"hash={reference['endpoint_state_hash']}",
+                flush=True,
+            )
+
+        if args.resume_checkpoint:
+            endpoint_hash = fingerprint_sha256(endpoint)
+            branch_metadata = {
+                "source_checkpoint": str(Path(args.resume_checkpoint)),
+                "source_checkpoint_sha256": source_checkpoint_sha256,
+                "starting_state_hash": starting_state_hash,
+                "endpoint_global_model_hash": model_state_sha256(
+                    global_model.state_dict()
+                ),
+                "endpoint_state_hash": endpoint_hash,
+                "parent_run_id": parent_run_id,
+                "branch_run_id": run_id,
+                "executed_round": int(r),
+                "projection_lambda": float(args.projection_lambda),
+                "determinism_gate": None,
+            }
+            if args.projection_lambda == 0.0:
+                gate = verify_endpoint_reference(args.determinism_reference, endpoint)
+                branch_metadata["determinism_gate"] = gate
+                report_name = (
+                    f"determinism_round_{r:02d}_lambda000_"
+                    f"{'PASS' if gate['passed'] else 'FAIL'}.json"
+                )
+                report_path = output_dir / report_name
+                report_path.write_text(
+                    json.dumps(branch_metadata, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+                if not gate["passed"]:
+                    raise RuntimeError(
+                        "DETERMINISM GATE FAILED; no branch CSVs were written. "
+                        f"Exact differences: {report_path}"
+                    )
+                print(f"[Determinism] exact continuation PASS: {report_path}", flush=True)
+            metadata_path = output_dir / "branch_metadata.json"
+            metadata_path.write_text(
+                json.dumps(branch_metadata, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+
+        if args.capture_common_checkpoints and (r + 1) in {1, 5}:
+            next_round = r + 1
+            checkpoint_path = checkpoint_dir / f"pre_round_{next_round:02d}.pt"
+            metadata = save_checkpoint(
+                checkpoint_path, _checkpoint_payload(next_round)
+            )
+            captured_checkpoint_metadata[next_round] = metadata
+            gib = metadata["size_bytes"] / (1024 ** 3)
+            print(
+                f"[Checkpoint] wrote {checkpoint_path} size={metadata['size_bytes']} "
+                f"bytes ({gib:.3f} GiB) sha256={metadata['sha256']}",
+                flush=True,
+            )
+
     # ---------------------------
     # Write CSVs
     # ---------------------------
-    pd.DataFrame(run_logs).to_csv(f"fcl_run_results_{run_id}_{args.tag}.csv", index=False)
-    pd.DataFrame(round_logs).to_csv(f"fcl_run_summary_{run_id}_{args.tag}.csv", index=False)
-    pd.DataFrame(cl_rows).to_csv(f"fcl_run_cl_batches_{run_id}_{args.tag}.csv", index=False)
+    results_path = output_dir / f"fcl_run_results_{run_id}_{args.tag}.csv"
+    summary_path = output_dir / f"fcl_run_summary_{run_id}_{args.tag}.csv"
+    cl_path = output_dir / f"fcl_run_cl_batches_{run_id}_{args.tag}.csv"
+    pd.DataFrame(run_logs).to_csv(results_path, index=False)
+    pd.DataFrame(round_logs).to_csv(summary_path, index=False)
+    pd.DataFrame(cl_rows).to_csv(cl_path, index=False)
     update_energy_rows = [
         {"run_id": run_id, "tag": args.tag, **row}
         for client in clients
         for row in client.update_energy_rows
     ]
-    step_energy_path = f"fcl_run_update_energy_steps_{run_id}_{args.tag}.csv"
-    round_energy_path = f"fcl_run_update_energy_rounds_{run_id}_{args.tag}.csv"
+    step_energy_path = output_dir / f"fcl_run_update_energy_steps_{run_id}_{args.tag}.csv"
+    round_energy_path = output_dir / f"fcl_run_update_energy_rounds_{run_id}_{args.tag}.csv"
     if update_energy_rows:
         pd.DataFrame(update_energy_rows).to_csv(step_energy_path, index=False)
         round_energy_rows = aggregate_update_energy_records(
-            update_energy_rows, rounds=range(args.rounds)
+            update_energy_rows, rounds=range(start_round, stop_round)
         )
         for row in round_energy_rows:
             row.update(
@@ -1197,9 +1602,7 @@ def main():
             )
         pd.DataFrame(round_energy_rows).to_csv(round_energy_path, index=False)
     print("✓ Wrote CSVs:",
-          f"fcl_run_results_{run_id}_{args.tag}.csv,",
-          f"fcl_run_summary_{run_id}_{args.tag}.csv,",
-          f"fcl_run_cl_batches_{run_id}_{args.tag}.csv", flush=True)
+          results_path, summary_path, cl_path, flush=True)
     if update_energy_rows:
         print("✓ Wrote update-energy CSVs:", step_energy_path, round_energy_path, flush=True)
     if subspace_instrumentation is not None:

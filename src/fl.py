@@ -38,6 +38,40 @@ class Client:
         self.update_energy_rows = []
         self._optimizer_step = 0
 
+    def persistent_state_dict(self):
+        """State outside the model/optimizer that persists across rounds."""
+        names = (
+            "_best_val",
+            "_no_improve",
+            "_last_vloss",
+            "_last_vacc",
+            "_last_lr_scale",
+            "_last_ewc_lambda",
+            "_optimizer_step",
+        )
+        return {
+            name: deepcopy(getattr(self, name))
+            for name in names
+            if hasattr(self, name)
+        }
+
+    def load_persistent_state_dict(self, state):
+        """Restore state outside the model/optimizer without touching either."""
+        allowed = {
+            "_best_val",
+            "_no_improve",
+            "_last_vloss",
+            "_last_vacc",
+            "_last_lr_scale",
+            "_last_ewc_lambda",
+            "_optimizer_step",
+        }
+        unexpected = set(state) - allowed
+        if unexpected:
+            raise ValueError(f"unexpected client state fields: {sorted(unexpected)}")
+        for name, value in state.items():
+            setattr(self, name, deepcopy(value))
+
 
     def load_state_from(self, global_model: nn.Module):
         # load weights then keep model on device

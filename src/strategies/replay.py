@@ -24,3 +24,33 @@ class ReplayBuffer:
         xs = torch.stack([s[0] for s in samples]).to(device)
         ys = torch.stack([s[1] for s in samples]).to(device)
         return xs, ys
+
+    def state_dict(self):
+        """Return a lossless FIFO snapshot of the replay buffer."""
+        return {
+            "capacity": int(self.capacity),
+            # These tensors already live on CPU. torch.save is synchronous, so
+            # retaining their references avoids doubling a multi-GB buffer.
+            "data": [(x.detach().cpu(), y.detach().cpu()) for x, y in self.data],
+        }
+
+    def load_state_dict(self, state):
+        """Restore a lossless FIFO snapshot without changing its ordering."""
+        if set(state) != {"capacity", "data"}:
+            raise ValueError("invalid replay-buffer state")
+        capacity = int(state["capacity"])
+        if capacity <= 0:
+            raise ValueError("replay-buffer capacity must be positive")
+        data = list(state["data"])
+        if len(data) > capacity:
+            raise ValueError("replay-buffer state exceeds its capacity")
+        restored = deque()
+        for item in data:
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                raise ValueError("replay-buffer entries must be (x, y) pairs")
+            x, y = item
+            if not isinstance(x, torch.Tensor) or not isinstance(y, torch.Tensor):
+                raise TypeError("replay-buffer entries must contain tensors")
+            restored.append((x.detach().cpu(), y.detach().cpu()))
+        self.capacity = capacity
+        self.data = restored

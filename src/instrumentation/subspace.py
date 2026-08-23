@@ -518,6 +518,49 @@ class SubspaceInstrumentation:
         self._ranks_at_start: Dict[str, int] = {}
         self._errors_at_start: Dict[str, float] = {}
 
+    def state_dict(self) -> Dict[str, object]:
+        """Return the persistent state needed at a completed-round boundary."""
+        if any(m.collect_enabled for m in self.monitors):
+            raise RuntimeError("subspace state may only be saved between rounds")
+        return {
+            "explained_energy": self.bank.explained_energy,
+            "max_rank": self.bank.max_rank,
+            "bases": {
+                name: basis.detach().cpu().clone()
+                for name, basis in self.bank.bases.items()
+            },
+            "completed_phases": sorted(int(p) for p in self.completed_phases),
+        }
+
+    def load_state_dict(self, state: Mapping[str, object]) -> None:
+        """Restore persistent state into monitors already attached to models."""
+        required = {"explained_energy", "max_rank", "bases", "completed_phases"}
+        if set(state) != required:
+            raise ValueError("invalid subspace-instrumentation state")
+        if float(state["explained_energy"]) != self.bank.explained_energy:
+            raise ValueError("subspace explained_energy differs from checkpoint")
+        if int(state["max_rank"]) != self.bank.max_rank:
+            raise ValueError("subspace max_rank differs from checkpoint")
+        bases = state["bases"]
+        if not isinstance(bases, Mapping):
+            raise TypeError("subspace bases must be a mapping")
+        self.bank.bases = {
+            str(name): basis.detach().cpu().clone()
+            for name, basis in bases.items()
+        }
+        self.completed_phases = {int(p) for p in state["completed_phases"]}
+        self._phase_id = None
+        self._ranks_at_start = {}
+        self._errors_at_start = {}
+        for monitor in self.monitors:
+            monitor.collect_enabled = False
+            monitor.samples = {}
+            monitor.sample_counts = {}
+            monitor.inside = 0.0
+            monitor.outside = 0.0
+            monitor.measurements = 0
+            monitor.overhead_seconds = 0.0
+
     def begin_round(self, phase_id: int) -> None:
         self._phase_id = int(phase_id)
         self._ranks_at_start = self.bank.ranks()
