@@ -88,3 +88,40 @@ python3 paper/plots_paper/lmss_geo/analyze_stage1_fixed_lambda.py
 ```
 
 Generated tables and plots are in `stage1_fixed_lambda/analysis/`.
+
+## Stage 1 mechanism validation
+
+The seed-42 learned-Φ λ=0.75 calibration run was compared with the frozen
+round × client × layer norm-matched scalar-shrinkage control. Across controlled
+rounds 1–6, all 48 round/client/layer step counts matched exactly. The global
+raw- and retained-energy differences were 0.37% and 0.41%; the largest
+cell-level energy difference was 3.89%, and the maximum retained-energy-fraction
+error was 6.88e-8. The control therefore matched the intended realized energy
+budget closely enough for the mechanism comparison.
+
+At round 6, learned-Φ obtained 51.96% accuracy and 2.94% mean forgetting,
+versus 52.19% and 3.14% for shrinkage. Learned-Φ had lower forgetting in every
+controlled round, but shrinkage had higher accuracy and AULC in every round;
+final divergence and β̂/ρ̂ were effectively equal. Neither method is
+Pareto-dominant. The older deterministic λ=0.75 run exactly reproduced the
+calibration run's non-timing summary metrics, so the observed paired differences
+exceed deterministic rerun variation, but this one-seed result does not establish
+statistical reliability. A further caveat is that the nominally no-op `s=1`
+shrinkage path was already 0.03 percentage points higher in round-0 accuracy;
+therefore a small finite-precision/control-path perturbation cannot be excluded
+from the later trajectory separation.
+
+Verdict: **INCONCLUSIVE**. Directional projection is not equivalent to scalar
+step shrinkage, but learned Φ does not yet show a superior
+stability–plasticity trade-off. Stage 2 should not begin yet. The single next
+experiment is a norm-matched random-Φ control at the same λ, seed, and protocol
+to test whether the learned directions outperform arbitrary directional
+restriction.
+
+Reproduce the analysis from the repository root with:
+
+```bash
+python3 paper/plots_paper/lmss_geo/analyze_stage1_mechanism.py
+```
+
+Generated tables and plots are in `stage1_fixed_lambda/analysis_mechanism/`.
