@@ -59,3 +59,32 @@ python3 paper/plots_paper/lmss_geo/analyze_stage0_measurement.py
 ```
 
 Generated tables and plots are in `stage0_measurement/analysis/`.
+
+## Stage 1 – Fixed soft projection
+
+The seed-42 Dirichlet α=0.1 sweep used fixed
+λ ∈ {0, 0.25, 0.5, 0.75, 1}. Final accuracy decreased monotonically from
+52.80% to 50.64% as λ increased, while mean forgetting decreased from 3.79%
+to 2.66%. AULC also decreased monotonically (42.86% to 41.15%), and final
+client divergence increased rather than decreased (0.0768 to 0.0921).
+
+No interior λ wins a requested endpoint: λ=0 gives the best final accuracy,
+AULC, and divergence, while λ=1 gives the lowest forgetting. However, λ=0.75
+is a descriptive knee, retaining about 75% of the full forgetting reduction at
+about 39% of the full accuracy cost. This indicates a stability–plasticity
+response, but does not establish that learned Φ protects knowledge better than
+generic directional update shrinkage.
+
+Decision: **CONDITIONAL GO**. Before Stage 2, run a same-rank deterministic
+random-Φ control at λ=0.75 and repeat the λ={0, 0.75, 1} comparison for at
+least one additional seed. Stage 2 adaptive-lambda experiments should not start
+until those controls confirm the learned-basis effect and response ordering.
+These seed-42 results do not establish statistical significance.
+
+Reproduce the analysis from the repository root with:
+
+```bash
+python3 paper/plots_paper/lmss_geo/analyze_stage1_fixed_lambda.py
+```
+
+Generated tables and plots are in `stage1_fixed_lambda/analysis/`.
