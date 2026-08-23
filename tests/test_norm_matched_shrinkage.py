@@ -3,6 +3,7 @@ import csv
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 import torch
 from torch import nn
@@ -93,7 +94,7 @@ class NormMatchedShrinkageChecks(unittest.TestCase):
     def test_round_zero_factor_one_leaves_realized_adam_update_unchanged(self):
         x = torch.tensor([[0.5, -1.0, 2.0], [1.5, 0.25, -0.75]])
         y = torch.tensor([0, 1])
-        loader = DataLoader(TensorDataset(x, y), batch_size=2, shuffle=False)
+        loader = DataLoader(TensorDataset(x, y), batch_size=1, shuffle=False)
         torch.manual_seed(17)
         initial = copy.deepcopy(TinyLinear().state_dict())
 
@@ -110,7 +111,14 @@ class NormMatchedShrinkageChecks(unittest.TestCase):
                     samples_per_batch=1,
                     samples_per_phase=1,
                 )
-                client.gradient_monitor = instrumentation.monitors[0]
+                monitor = instrumentation.monitors[0]
+                client.gradient_monitor = monitor
+                monitor.snapshot_target_weights = Mock(
+                    wraps=monitor.snapshot_target_weights
+                )
+                monitor.shrink_parameter_updates = Mock(
+                    wraps=monitor.shrink_parameter_updates
+                )
                 client.train_one_epoch(
                     replay_ratio=0.0,
                     log_interval=99,
@@ -121,16 +129,29 @@ class NormMatchedShrinkageChecks(unittest.TestCase):
             else:
                 client.train_one_epoch(replay_ratio=0.0, log_interval=99)
             state = copy.deepcopy(model.state_dict())
+            optimizer_state = copy.deepcopy(optimizer.state_dict())
+            monitor_calls = None
             if instrumentation is not None:
+                monitor_calls = (
+                    instrumentation.monitors[0].snapshot_target_weights.call_count,
+                    instrumentation.monitors[0].shrink_parameter_updates.call_count,
+                )
                 instrumentation.close()
-            return state, client.update_energy_rows
+            return state, optimizer_state, client.update_energy_rows, monitor_calls
 
-        baseline, _ = run(False)
-        controlled, rows = run(True)
+        baseline, baseline_optimizer, _, _ = run(False)
+        controlled, controlled_optimizer, rows, monitor_calls = run(True)
         self.assertTrue(torch.equal(baseline["fc.weight"], controlled["fc.weight"]))
-        self.assertEqual(rows[0]["round"], 0)
-        self.assertEqual(rows[0]["shrinkage_factor"], 1.0)
-        self.assertEqual(rows[0]["retained_energy_fraction"], 1.0)
+        self.assertEqual(baseline_optimizer["param_groups"], controlled_optimizer["param_groups"])
+        for baseline_state, controlled_state in zip(
+            baseline_optimizer["state"].values(),
+            controlled_optimizer["state"].values(),
+        ):
+            self.assertEqual(baseline_state.keys(), controlled_state.keys())
+            for key in baseline_state:
+                self.assertTrue(torch.equal(baseline_state[key], controlled_state[key]))
+        self.assertEqual(rows, [])
+        self.assertEqual(monitor_calls, (0, 0))
 
     def test_shrinkage_applies_schedule_when_projection_lambda_is_zero(self):
         x = torch.tensor(

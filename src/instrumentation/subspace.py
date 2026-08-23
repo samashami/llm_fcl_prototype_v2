@@ -396,11 +396,19 @@ class _ModelMonitor:
         }
 
     @torch.no_grad()
-    def snapshot_target_weights(self) -> Dict[str, torch.Tensor]:
-        """Clone all controlled weights without consulting the subspace bank."""
+    def snapshot_target_weights(
+        self, layer_names: Optional[Iterable[str]] = None
+    ) -> Dict[str, torch.Tensor]:
+        """Clone selected controlled weights without consulting the subspace bank."""
+        selected = (
+            {target.name for target in self.targets}
+            if layer_names is None
+            else set(layer_names)
+        )
         return {
             target.name: self.modules[target.name].weight.detach().clone()
             for target in self.targets
+            if target.name in selected
         }
 
     @torch.no_grad()
@@ -447,12 +455,14 @@ class _ModelMonitor:
         for target in self.targets:
             if target.name not in factors_by_layer:
                 raise ValueError(f"missing shrinkage factor for layer {target.name!r}")
+            factor = float(factors_by_layer[target.name])
+            if factor == 1.0:
+                continue
             weight_before = weights_before.get(target.name)
             if weight_before is None:
                 raise ValueError(f"missing pre-step weight for layer {target.name!r}")
             weight = self.modules[target.name].weight
             displacement = (weight.detach() - weight_before).reshape(weight.shape[0], -1)
-            factor = float(factors_by_layer[target.name])
             shrunk = scalar_shrink_rows(displacement, factor)
             weight.copy_((weight_before.reshape(weight.shape[0], -1) + shrunk).reshape_as(weight))
             record = realized_update_energy(displacement, shrunk)

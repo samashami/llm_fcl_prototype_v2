@@ -106,10 +106,26 @@ class Client:
             shrinkage_active = (
                 update_control == "shrinkage" and self.gradient_monitor is not None
             )
+            shrinkage_layers = set()
+            if shrinkage_active:
+                if shrinkage_factors is None:
+                    raise ValueError("shrinkage mode requires factors for every protected layer")
+                expected_layers = {
+                    target.name for target in self.gradient_monitor.targets
+                }
+                if set(shrinkage_factors) != expected_layers:
+                    raise ValueError("shrinkage mode requires factors for every protected layer")
+                shrinkage_layers = {
+                    name
+                    for name, factor in shrinkage_factors.items()
+                    if float(factor) != 1.0
+                }
             if projection_active:
                 protected_weights = self.gradient_monitor.snapshot_protected_weights()
-            elif shrinkage_active:
-                protected_weights = self.gradient_monitor.snapshot_target_weights()
+            elif shrinkage_layers:
+                protected_weights = self.gradient_monitor.snapshot_target_weights(
+                    shrinkage_layers
+                )
             self.optimizer.step()
             if projection_active or shrinkage_active:
                 self._optimizer_step += 1
@@ -118,9 +134,7 @@ class Client:
                 energy_records = self.gradient_monitor.soft_project_parameter_updates(
                     protected_weights, projection_lambda
                 )
-            elif shrinkage_active:
-                if shrinkage_factors is None:
-                    raise ValueError("shrinkage mode requires factors for every protected layer")
+            elif shrinkage_layers:
                 energy_records = self.gradient_monitor.shrink_parameter_updates(
                     protected_weights, shrinkage_factors
                 )
