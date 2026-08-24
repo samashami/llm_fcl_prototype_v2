@@ -305,6 +305,59 @@ class NormMatchedShrinkageChecks(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 derive_schedule(step_log, output, rounds=2, clients=1, layers=("fc",))
 
+    def test_single_round_late_schedule_is_complete_and_loader_compatible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            step_log = root / "late_lambda100_update_energy_steps.csv"
+            output = root / "late_round5_schedule.csv"
+            rows = []
+            for client in range(4):
+                for layer in ("layer4_1_conv2", "fc"):
+                    rows.append({
+                        "round": 5,
+                        "client": client,
+                        "layer": layer,
+                        "update_control": "projection",
+                        "projection_lambda": 1.0,
+                        "raw_update_energy": 4.0,
+                        "projected_update_energy": 1.0,
+                    })
+            with step_log.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+
+            schedule = derive_schedule(
+                step_log,
+                output,
+                rounds=7,
+                clients=4,
+                layers=("layer4_1_conv2", "fc"),
+                projection_lambda=1.0,
+                calibration_round=5,
+            )
+            late = schedule[schedule["round"] == 5]
+            self.assertEqual(len(late), 8)
+            self.assertEqual(
+                len(late[["client", "layer"]].drop_duplicates()), 8
+            )
+            self.assertTrue((late["shrinkage_factor"] == 0.5).all())
+            unused = schedule[schedule["round"] != 5]
+            self.assertTrue((unused["shrinkage_factor"] == 1.0).all())
+            self.assertEqual(schedule["source_sha256"].nunique(), 1)
+            self.assertRegex(schedule.iloc[0]["source_sha256"], r"^[0-9a-f]{64}$")
+
+            expected = {
+                (round_id, client, layer)
+                for round_id in range(7)
+                for client in range(4)
+                for layer in ("layer4_1_conv2", "fc")
+            }
+            loaded = load_shrinkage_schedule(output, expected)
+            self.assertEqual(len(loaded), len(expected))
+            self.assertEqual(loaded[(5, 0, "fc")], 0.5)
+            self.assertEqual(loaded[(4, 0, "fc")], 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

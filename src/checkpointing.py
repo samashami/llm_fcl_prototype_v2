@@ -228,6 +228,101 @@ def load_checkpoint(path: os.PathLike[str] | str) -> tuple[Dict[str, Any], Dict[
     return payload, metadata
 
 
+def validate_resume_protocol(
+    checkpoint_protocol: Mapping[str, Any], current_protocol: Mapping[str, Any]
+) -> None:
+    """Allow only projection -> projection/shrinkage treatment changes on resume."""
+    checkpoint = dict(checkpoint_protocol)
+    current = dict(current_protocol)
+    checkpoint_treatment = checkpoint.pop("update_control", None)
+    current_treatment = current.pop("update_control", None)
+    if checkpoint_treatment != "projection":
+        raise RuntimeError(
+            "resume checkpoint must have update_control='projection', got "
+            f"{checkpoint_treatment!r}"
+        )
+    if current_treatment not in {"projection", "shrinkage"}:
+        raise RuntimeError(f"invalid resumed update_control {current_treatment!r}")
+    if checkpoint != current:
+        missing = object()
+        differing = {
+            key: {
+                "checkpoint": (
+                    "<missing>" if checkpoint.get(key, missing) is missing else checkpoint[key]
+                ),
+                "current": (
+                    "<missing>" if current.get(key, missing) is missing else current[key]
+                ),
+            }
+            for key in sorted(set(checkpoint) | set(current))
+            if checkpoint.get(key, missing) != current.get(key, missing)
+        }
+        raise RuntimeError(
+            "resume protocol differs from checkpoint outside update_control: "
+            f"{differing}"
+        )
+
+
+def requires_endpoint_equality(update_control: str, projection_lambda: float) -> bool:
+    """Only the no-treatment projection branch is an exact parent continuation."""
+    return update_control == "projection" and projection_lambda == 0.0
+
+
+def validate_determinism_gate(
+    gate_path: os.PathLike[str] | str,
+    *,
+    parent_run_id: str,
+    executed_round: int,
+    source_checkpoint_sha256: str,
+) -> Dict[str, Any]:
+    """Validate the one exact-continuation gate relevant to a resumed checkpoint."""
+    gate_path = Path(gate_path)
+    if not gate_path.is_file():
+        raise RuntimeError(f"branch blocked: missing determinism gate {gate_path}")
+    document = json.loads(gate_path.read_text(encoding="utf-8"))
+    if not document.get("determinism_gate", {}).get("passed", False):
+        raise RuntimeError(f"branch blocked: determinism gate did not pass {gate_path}")
+    expected = {
+        "parent_run_id": str(parent_run_id),
+        "executed_round": int(executed_round),
+        "source_checkpoint_sha256": str(source_checkpoint_sha256),
+    }
+    actual = {key: document.get(key) for key in expected}
+    if actual != expected:
+        raise RuntimeError(
+            "branch blocked: determinism gate belongs to another checkpoint: "
+            f"expected={expected}, found={actual}"
+        )
+    return document
+
+
+def branch_control_metadata(
+    *,
+    update_control: str,
+    branch_local_epochs: int | None,
+    shrinkage_schedule: os.PathLike[str] | str | None,
+    client_epoch_counts: Mapping[int, int],
+    client_optimizer_step_counts: Mapping[int, int],
+) -> Dict[str, Any]:
+    """Build auditable treatment/compute metadata for a one-round branch."""
+    schedule_path = str(Path(shrinkage_schedule)) if shrinkage_schedule else None
+    return {
+        "update_control": update_control,
+        "branch_local_epochs": branch_local_epochs,
+        "shrinkage_schedule_path": schedule_path,
+        "shrinkage_schedule_sha256": (
+            sha256_file(shrinkage_schedule) if shrinkage_schedule else None
+        ),
+        "per_client_epoch_counts": {
+            str(key): int(value) for key, value in client_epoch_counts.items()
+        },
+        "per_client_optimizer_step_counts": {
+            str(key): int(value)
+            for key, value in client_optimizer_step_counts.items()
+        },
+    }
+
+
 def endpoint_state(
     global_model,
     clients,

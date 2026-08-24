@@ -27,6 +27,7 @@ from src.instrumentation.subspace import (
 from src.instrumentation.shrinkage import load_shrinkage_schedule
 from src.checkpointing import (
     CHECKPOINT_FORMAT_VERSION,
+    branch_control_metadata,
     capture_rng_state,
     endpoint_state,
     fingerprint_sha256,
@@ -34,7 +35,10 @@ from src.checkpointing import (
     model_state_sha256,
     protocol_manifest,
     restore_rng_state,
+    requires_endpoint_equality,
     save_checkpoint,
+    validate_determinism_gate,
+    validate_resume_protocol,
     verify_endpoint_reference,
     write_endpoint_reference,
 )
@@ -58,6 +62,16 @@ V4_LR_COOLDOWN   = 1.50
 V4_CLIENT_LR_MIN, V4_CLIENT_LR_MAX = 0.8, 1.2
 V4_ROLLBACK_THR  = 0.015         # allow 1.5% drop before rollback
 V4_WARMUP_ROUNDS = 2
+
+
+def local_epoch_budget(configured_epochs, branch_local_epochs):
+    """Return the production epoch budget without changing the ordinary path."""
+    return configured_epochs if branch_local_epochs is None else branch_local_epochs
+
+
+def should_stop_local_training(early_stop, branch_local_epochs):
+    """Honor early stopping unless a resumed branch has a fixed compute budget."""
+    return bool(early_stop) and branch_local_epochs is None
 
 
 def make_dirichlet_client_splits(train_indices, targets, n_clients, alpha, seed):
@@ -437,6 +451,12 @@ def main():
     ap.add_argument("--common_checkpoint_dir", type=str, default=None)
     ap.add_argument("--resume_checkpoint", type=str, default=None)
     ap.add_argument(
+        "--branch_local_epochs",
+        type=int,
+        default=None,
+        help="fixed local epoch budget for every client in a resumed one-round branch",
+    )
+    ap.add_argument(
         "--one_round",
         action="store_true",
         help="execute only the checkpoint's next round, then stop",
@@ -451,7 +471,7 @@ def main():
         "--determinism_gate_dir",
         type=str,
         default=None,
-        help="directory containing both lambda=0 PASS reports; required for nonzero branches",
+        help="directory containing the lambda=0 PASS report for this checkpoint",
     )
     ap.add_argument("--output_dir", type=str, default=".")
     args = ap.parse_args()
@@ -472,15 +492,33 @@ def main():
             ap.error("--resume_checkpoint requires --one_round")
         if args.controller != "fixed" or args.optimizer != "adam":
             ap.error("common-checkpoint branches require fixed controller and Adam")
-        if args.update_control != "projection" or not args.measure_subspaces:
-            ap.error("common-checkpoint branches require measured projection mode")
-        if args.projection_lambda == 0.0 and not args.determinism_reference:
+        if not args.measure_subspaces:
+            ap.error("common-checkpoint branches require --measure_subspaces")
+        if args.branch_local_epochs is not None and not (
+            1 <= args.branch_local_epochs <= args.epochs
+        ):
+            ap.error("--branch_local_epochs must satisfy 1 <= value <= --epochs")
+        if (
+            args.update_control == "projection"
+            and args.projection_lambda == 0.0
+            and not args.determinism_reference
+        ):
             ap.error("a resumed lambda=0 branch requires --determinism_reference")
-        if args.projection_lambda != 0.0 and not args.determinism_gate_dir:
-            ap.error("nonzero branches require --determinism_gate_dir")
-    elif args.one_round or args.determinism_reference or args.determinism_gate_dir:
+        if (
+            not requires_endpoint_equality(
+                args.update_control, args.projection_lambda
+            )
+            and not args.determinism_gate_dir
+        ):
+            ap.error("treatment branches require --determinism_gate_dir")
+    elif (
+        args.one_round
+        or args.determinism_reference
+        or args.determinism_gate_dir
+        or args.branch_local_epochs is not None
+    ):
         ap.error(
-            "--one_round/--determinism_reference/--determinism_gate_dir "
+            "branch resume options "
             "require --resume_checkpoint"
         )
 
@@ -696,11 +734,7 @@ def main():
     }
     if resume_payload is not None:
         checkpoint_manifest = resume_payload.get("manifest", {})
-        if checkpoint_manifest.get("protocol") != protocol:
-            raise RuntimeError(
-                "resume protocol differs from checkpoint: "
-                f"checkpoint={checkpoint_manifest.get('protocol')}, current={protocol}"
-            )
+        validate_resume_protocol(checkpoint_manifest.get("protocol", {}), protocol)
         if resume_payload.get("data_state") != data_state:
             raise RuntimeError("train/validation split, client split, or CL schedule differs")
 
@@ -935,7 +969,7 @@ def main():
             f"sha256={source_checkpoint_sha256}",
             flush=True,
         )
-        if args.projection_lambda == 0.0:
+        if requires_endpoint_equality(args.update_control, args.projection_lambda):
             reference_document = json.loads(
                 Path(args.determinism_reference).read_text(encoding="utf-8")
             )
@@ -958,29 +992,21 @@ def main():
                 )
         else:
             gate_dir = Path(args.determinism_gate_dir)
-            gate_paths = [
-                gate_dir / "determinism_round_01_lambda000_PASS.json",
-                gate_dir / "determinism_round_05_lambda000_PASS.json",
-            ]
-            gate_documents = []
-            for gate_path in gate_paths:
-                if not gate_path.is_file():
-                    raise RuntimeError(
-                        f"nonzero branch blocked: missing determinism gate {gate_path}"
-                    )
-                document = json.loads(gate_path.read_text(encoding="utf-8"))
-                if not document.get("determinism_gate", {}).get("passed", False):
-                    raise RuntimeError(
-                        f"nonzero branch blocked: determinism gate did not pass {gate_path}"
-                    )
-                gate_documents.append(document)
-            if any(doc.get("parent_run_id") != parent_run_id for doc in gate_documents):
-                raise RuntimeError(
-                    "nonzero branch blocked: determinism gates belong to another parent"
-                )
+            gate_path = (
+                gate_dir
+                / f"determinism_round_{start_round:02d}_lambda000_PASS.json"
+            )
+            validate_determinism_gate(
+                gate_path,
+                parent_run_id=parent_run_id,
+                executed_round=start_round,
+                source_checkpoint_sha256=source_checkpoint_sha256,
+            )
 
     stop_round = start_round + 1 if args.one_round else args.rounds
     captured_checkpoint_metadata = {}
+    branch_client_epoch_counts = {int(client.cid): 0 for client in clients}
+    branch_client_optimizer_step_counts = {int(client.cid): 0 for client in clients}
 
     def _metric_state():
         return {
@@ -1298,7 +1324,8 @@ def main():
                   f"(new={len(batch_indices)}; replay≈{hp['replay_ratio']:.2f}, LR_scale={c._last_lr_scale:.2f})",
                   flush=True)
 
-            for e in range(args.epochs):
+            epoch_budget = local_epoch_budget(args.epochs, args.branch_local_epochs)
+            for e in range(epoch_budget):
                 avg_loss, epoch_acc, stop = c.train_one_epoch(
                     replay_ratio=hp["replay_ratio"],
                     epoch=e,
@@ -1328,7 +1355,10 @@ def main():
                     "val_loss": float(getattr(c, "_last_vloss", float("nan"))),
                     "val_acc": float(getattr(c, "_last_vacc", float("nan"))),
                 })
-                if stop:
+                if args.resume_checkpoint:
+                    branch_client_epoch_counts[int(c.cid)] += 1
+                    branch_client_optimizer_step_counts[int(c.cid)] += len(c.loader)
+                if should_stop_local_training(stop, args.branch_local_epochs):
                     print(f"[Client {c.cid}] Early stopping (patience {c.early_patience})", flush=True)
                     break
 
@@ -1530,9 +1560,18 @@ def main():
                 "branch_run_id": run_id,
                 "executed_round": int(r),
                 "projection_lambda": float(args.projection_lambda),
+                **branch_control_metadata(
+                    update_control=args.update_control,
+                    branch_local_epochs=args.branch_local_epochs,
+                    shrinkage_schedule=args.shrinkage_schedule,
+                    client_epoch_counts=branch_client_epoch_counts,
+                    client_optimizer_step_counts=branch_client_optimizer_step_counts,
+                ),
                 "determinism_gate": None,
             }
-            if args.projection_lambda == 0.0:
+            if requires_endpoint_equality(
+                args.update_control, args.projection_lambda
+            ):
                 gate = verify_endpoint_reference(args.determinism_reference, endpoint)
                 branch_metadata["determinism_gate"] = gate
                 report_name = (

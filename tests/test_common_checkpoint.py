@@ -12,18 +12,26 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.checkpointing import (
     CHECKPOINT_FORMAT_VERSION,
+    branch_control_metadata,
     capture_rng_state,
     endpoint_state,
     flatten_fingerprints,
     load_checkpoint,
     restore_rng_state,
+    requires_endpoint_equality,
     save_checkpoint,
+    validate_determinism_gate,
+    validate_resume_protocol,
     verify_endpoint_reference,
     write_endpoint_reference,
 )
 from src.fl import Client
 from src.instrumentation.subspace import LayerTarget, SubspaceInstrumentation
 from src.strategies.replay import ReplayBuffer
+from src.run_llm_fcl_controller import (
+    local_epoch_budget,
+    should_stop_local_training,
+)
 
 
 class TinyNet(nn.Module):
@@ -97,16 +105,19 @@ def make_loader(generator):
     )
 
 
-def run_round(model, client, instrumentation, generator, round_id):
+def run_round(model, client, instrumentation, generator, round_id, local_epochs=1):
     client.loader = make_loader(generator)
     instrumentation.begin_round(round_id)
-    loss, accuracy, _ = client.train_one_epoch(
-        replay_ratio=0.5,
-        projection_lambda=0.0,
-        update_control="projection",
-        round_id=round_id,
-        log_interval=99,
-    )
+    for epoch in range(local_epochs):
+        loss, accuracy, _ = client.train_one_epoch(
+            replay_ratio=0.5,
+            epoch=epoch,
+            total_epochs=local_epochs,
+            projection_lambda=0.0,
+            update_control="projection",
+            round_id=round_id,
+            log_interval=99,
+        )
     subspace = instrumentation.end_round()
     summary = {
         "round": round_id,
@@ -174,7 +185,8 @@ class CommonCheckpointChecks(unittest.TestCase):
             self.assertEqual(metadata["size_bytes"], checkpoint_path.stat().st_size)
 
             parent_endpoint = run_round(
-                model, client, instrumentation, generator, round_id=1
+                model, client, instrumentation, generator, round_id=1,
+                local_epochs=3,
             )
             reference_path = root / "parent_endpoint_round_01.json"
             write_endpoint_reference(
@@ -202,6 +214,7 @@ class CommonCheckpointChecks(unittest.TestCase):
                 restored_instrumentation,
                 restored_generator,
                 round_id=1,
+                local_epochs=3,
             )
 
             gate = verify_endpoint_reference(reference_path, restored_endpoint)
@@ -213,6 +226,127 @@ class CommonCheckpointChecks(unittest.TestCase):
             )
             restored_instrumentation.close()
         instrumentation.close()
+
+    @staticmethod
+    def _executed_epochs(stop_values, branch_local_epochs):
+        count = 0
+        for stop in stop_values[:local_epoch_budget(5, branch_local_epochs)]:
+            count += 1
+            if should_stop_local_training(stop, branch_local_epochs):
+                break
+        return count
+
+    def test_fixed_branch_compute_is_identical_across_treatments(self):
+        projection_zero = self._executed_epochs([False, True, True], 3)
+        projection_one = self._executed_epochs([True, True, True], 3)
+        shrinkage = self._executed_epochs([False, False, True], 3)
+        self.assertEqual(
+            (projection_zero, projection_one, shrinkage), (3, 3, 3)
+        )
+        batches_per_epoch = 4
+        self.assertEqual(
+            tuple(count * batches_per_epoch for count in (
+                projection_zero, projection_one, shrinkage
+            )),
+            (12, 12, 12),
+        )
+
+    def test_absent_branch_budget_preserves_ordinary_early_stopping(self):
+        self.assertEqual(self._executed_epochs([False, True, False], None), 2)
+
+    def test_shrinkage_does_not_enter_lambda_zero_endpoint_comparator(self):
+        self.assertTrue(requires_endpoint_equality("projection", 0.0))
+        self.assertFalse(requires_endpoint_equality("projection", 1.0))
+        self.assertFalse(requires_endpoint_equality("shrinkage", 0.0))
+
+    def test_resume_protocol_allows_only_treatment_change(self):
+        parent = {"seed": 42, "epochs": 5, "update_control": "projection"}
+        validate_resume_protocol(parent, dict(parent))
+        validate_resume_protocol(
+            parent, {"seed": 42, "epochs": 5, "update_control": "shrinkage"}
+        )
+        with self.assertRaisesRegex(RuntimeError, "outside update_control"):
+            validate_resume_protocol(
+                parent, {"seed": 43, "epochs": 5, "update_control": "shrinkage"}
+            )
+
+    def test_gate_must_match_the_resumed_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate_path = Path(directory) / "gate.json"
+            gate_path.write_text(
+                json.dumps({
+                    "parent_run_id": "parent",
+                    "executed_round": 5,
+                    "source_checkpoint_sha256": "abc",
+                    "determinism_gate": {"passed": True},
+                }),
+                encoding="utf-8",
+            )
+            document = validate_determinism_gate(
+                gate_path,
+                parent_run_id="parent",
+                executed_round=5,
+                source_checkpoint_sha256="abc",
+            )
+            self.assertTrue(document["determinism_gate"]["passed"])
+            with self.assertRaisesRegex(RuntimeError, "another checkpoint"):
+                validate_determinism_gate(
+                    gate_path,
+                    parent_run_id="parent",
+                    executed_round=1,
+                    source_checkpoint_sha256="abc",
+                )
+
+    def test_projection_and_shrinkage_load_same_start_state_hash(self):
+        generator = torch.Generator().manual_seed(29)
+        model, client, instrumentation = make_runtime()
+        payload = {
+            "format_version": CHECKPOINT_FORMAT_VERSION,
+            "next_round": 5,
+            "parent_run_id": "synthetic-parent",
+            "global_model": copy.deepcopy(model.state_dict()),
+            "clients": [],
+            "subspace": instrumentation.state_dict(),
+            "metrics": {},
+            "rng": capture_rng_state(generator),
+            "data_state": {},
+            "manifest": {"protocol": {"update_control": "projection"}},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pre_round_05.pt"
+            saved = save_checkpoint(path, payload)
+            _, projection_metadata = load_checkpoint(path)
+            _, shrinkage_metadata = load_checkpoint(path)
+            self.assertEqual(
+                projection_metadata["starting_state_hash"],
+                shrinkage_metadata["starting_state_hash"],
+            )
+            self.assertEqual(
+                projection_metadata["starting_state_hash"],
+                saved["starting_state_hash"],
+            )
+        instrumentation.close()
+
+    def test_branch_metadata_records_schedule_checksum_and_compute(self):
+        with tempfile.TemporaryDirectory() as directory:
+            schedule = Path(directory) / "schedule.csv"
+            schedule.write_text("frozen schedule\n", encoding="utf-8")
+            metadata = branch_control_metadata(
+                update_control="shrinkage",
+                branch_local_epochs=3,
+                shrinkage_schedule=schedule,
+                client_epoch_counts={0: 3, 1: 3},
+                client_optimizer_step_counts={0: 12, 1: 15},
+            )
+            self.assertEqual(metadata["update_control"], "shrinkage")
+            self.assertEqual(metadata["branch_local_epochs"], 3)
+            self.assertEqual(metadata["shrinkage_schedule_path"], str(schedule))
+            self.assertRegex(metadata["shrinkage_schedule_sha256"], r"^[0-9a-f]{64}$")
+            self.assertEqual(metadata["per_client_epoch_counts"], {"0": 3, "1": 3})
+            self.assertEqual(
+                metadata["per_client_optimizer_step_counts"],
+                {"0": 12, "1": 15},
+            )
 
     def test_gate_reports_exact_differing_path(self):
         model, client, instrumentation = make_runtime()

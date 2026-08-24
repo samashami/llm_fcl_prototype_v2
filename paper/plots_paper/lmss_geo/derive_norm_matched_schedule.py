@@ -36,10 +36,14 @@ def derive_schedule(
     rounds: int = 7,
     clients: int = 4,
     layers=DEFAULT_LAYERS,
+    projection_lambda: float = 0.75,
+    calibration_round: int | None = None,
 ) -> pd.DataFrame:
     """Derive and exclusively create the frozen schedule CSV."""
     if rounds <= 0 or clients <= 0:
         raise ValueError("rounds and clients must be positive")
+    if calibration_round is not None and not 0 <= calibration_round < rounds:
+        raise ValueError("calibration_round must satisfy 0 <= value < rounds")
     source = pd.read_csv(step_log)
     missing = sorted(REQUIRED_COLUMNS.difference(source.columns))
     if missing:
@@ -48,9 +52,18 @@ def derive_schedule(
         raise ValueError("calibration log must contain projection updates only")
     lambdas = source["projection_lambda"].dropna().astype(float).unique()
     if len(lambdas) != 1 or not math.isclose(
-        float(lambdas[0]), 0.75, rel_tol=0.0, abs_tol=1e-12
+        float(lambdas[0]), projection_lambda, rel_tol=0.0, abs_tol=1e-12
     ):
-        raise ValueError("calibration log must be from learned-Phi lambda=0.75")
+        raise ValueError(
+            "calibration log projection lambda does not match "
+            f"--projection-lambda={projection_lambda:g}"
+        )
+    source_rounds = set(source["round"].dropna().astype(int).unique())
+    if calibration_round is not None and source_rounds != {calibration_round}:
+        raise ValueError(
+            "single-round calibration log must contain only round "
+            f"{calibration_round}, found {sorted(source_rounds)}"
+        )
 
     grouped = (
         source.groupby(["round", "client", "layer"], as_index=False)
@@ -71,7 +84,11 @@ def derive_schedule(
         for client_id in range(clients):
             for layer in layers:
                 key = (round_id, client_id, layer)
-                if round_id == 0:
+                use_calibration = (
+                    round_id != 0
+                    and (calibration_round is None or round_id == calibration_round)
+                )
+                if not use_calibration:
                     raw = retained = 0.0
                     count = 0
                     retained_fraction = 1.0
@@ -104,6 +121,9 @@ def derive_schedule(
                         "retained_update_energy_sum": retained,
                         "retained_energy_fraction": retained_fraction,
                         "projected_step_count": count,
+                        "projection_lambda": float(projection_lambda),
+                        "calibration_round": calibration_round,
+                        "used_for_calibration": use_calibration,
                         "source_file": step_log.name,
                         "source_sha256": source_checksum,
                         "derivation": "sqrt(sum(projected_update_energy)/sum(raw_update_energy))",
@@ -123,6 +143,8 @@ def parse_args():
     parser.add_argument("--rounds", type=int, default=7)
     parser.add_argument("--clients", type=int, default=4)
     parser.add_argument("--layers", nargs="+", default=list(DEFAULT_LAYERS))
+    parser.add_argument("--projection-lambda", type=float, default=0.75)
+    parser.add_argument("--calibration-round", type=int, default=None)
     return parser.parse_args()
 
 
@@ -134,10 +156,11 @@ def main():
         rounds=args.rounds,
         clients=args.clients,
         layers=tuple(args.layers),
+        projection_lambda=args.projection_lambda,
+        calibration_round=args.calibration_round,
     )
     print(f"Wrote immutable schedule: {args.output} ({len(schedule)} entries)")
 
 
 if __name__ == "__main__":
     main()
-
