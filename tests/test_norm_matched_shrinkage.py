@@ -1,5 +1,6 @@
 import copy
 import csv
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -152,6 +153,112 @@ class NormMatchedShrinkageChecks(unittest.TestCase):
                 self.assertTrue(torch.equal(baseline_state[key], controlled_state[key]))
         self.assertEqual(rows, [])
         self.assertEqual(monitor_calls, (0, 0))
+
+    def test_online_shrinkage_matches_counterfactual_projection_energy_and_direction(self):
+        model = TinyLinear().to(dtype=torch.float64)
+        instrumentation = SubspaceInstrumentation(
+            [model],
+            targets=(LayerTarget("fc", "fc"),),
+            samples_per_batch=1,
+            samples_per_phase=1,
+        )
+        monitor = instrumentation.monitors[0]
+        basis = torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]],
+            dtype=torch.float64,
+        )
+        monitor.bank.bases["fc"] = basis
+        before = monitor.snapshot_target_weights()["fc"]
+
+        raw = torch.tensor(
+            [[3.0, -4.0, 1.0], [2.0, 5.0, -1.0]],
+            dtype=torch.float64,
+        )
+        projected = soft_project_rows(raw, basis, 0.5)
+        expected_factor = math.sqrt(
+            float(projected.square().sum().item()) / max(float(raw.square().sum().item()), 1e-12)
+        )
+
+        with torch.no_grad():
+            model.fc.weight.copy_(before + raw)
+        records = monitor.online_shrink_parameter_updates(
+            {"fc": before},
+            projection_lambda=0.5,
+        )
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        applied = model.fc.weight.detach() - before
+        self.assertAlmostEqual(
+            record["counterfactual_projected_energy"],
+            float(projected.square().sum().item()),
+            places=12,
+        )
+        self.assertAlmostEqual(
+            record["applied_control_energy"],
+            float(applied.square().sum().item()),
+            places=12,
+        )
+        self.assertAlmostEqual(
+            record["retained_energy_fraction"],
+            record["counterfactual_projected_energy"] / max(record["raw_update_energy"], 1e-12),
+            places=12,
+        )
+        self.assertAlmostEqual(record["shrinkage_factor"], expected_factor, places=12)
+        self.assertAlmostEqual(
+            record["applied_control_energy"],
+            record["counterfactual_projected_energy"],
+            places=12,
+        )
+        self.assertTrue(torch.allclose(applied, expected_factor * raw, atol=1e-12, rtol=0.0))
+        self.assertTrue(
+            torch.allclose(
+                applied,
+                ((applied * raw).sum() / max(raw.square().sum(), 1e-12)) * raw,
+                atol=1e-12,
+                rtol=0.0,
+            )
+        )
+        instrumentation.close()
+
+    def test_online_mode_does_not_require_csv_schedule(self):
+        x = torch.tensor(
+            [[0.5, -1.0, 2.0], [1.5, 0.25, -0.75]], dtype=torch.float64
+        )
+        y = torch.tensor([0, 1])
+        loader = DataLoader(TensorDataset(x, y), batch_size=2, shuffle=False)
+        torch.manual_seed(41)
+        model = TinyLinear().to(dtype=torch.float64)
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+        instrumentation = SubspaceInstrumentation(
+            [model],
+            targets=(LayerTarget("fc", "fc"),),
+            samples_per_batch=1,
+            samples_per_phase=1,
+        )
+        basis = torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]],
+            dtype=torch.float64,
+        )
+        instrumentation.monitors[0].bank.bases["fc"] = basis
+        client = Client(
+            0,
+            model,
+            optimizer,
+            loader,
+            replay=None,
+            gradient_monitor=instrumentation.monitors[0],
+        )
+        client.train_one_epoch(
+            replay_ratio=0.0,
+            log_interval=99,
+            update_control="shrinkage_online",
+            projection_lambda=0.5,
+            round_id=1,
+        )
+        self.assertEqual(len(client.update_energy_rows), 1)
+        self.assertEqual(client.update_energy_rows[0]["update_control"], "shrinkage_online")
+        self.assertEqual(client.update_energy_rows[0]["projection_lambda"], 0.5)
+        instrumentation.close()
 
     def test_shrinkage_applies_schedule_when_projection_lambda_is_zero(self):
         x = torch.tensor(

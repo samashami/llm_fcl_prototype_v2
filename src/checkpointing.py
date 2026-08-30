@@ -241,7 +241,7 @@ def validate_resume_protocol(
             "resume checkpoint must have update_control='projection', got "
             f"{checkpoint_treatment!r}"
         )
-    if current_treatment not in {"projection", "shrinkage"}:
+    if current_treatment not in {"projection", "shrinkage", "shrinkage_online"}:
         raise RuntimeError(f"invalid resumed update_control {current_treatment!r}")
     if checkpoint != current:
         missing = object()

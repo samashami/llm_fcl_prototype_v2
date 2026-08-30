@@ -439,7 +439,7 @@ def main():
     )
     ap.add_argument(
         "--update_control",
-        choices=["projection", "shrinkage"],
+        choices=["projection", "shrinkage", "shrinkage_online"],
         default="projection",
     )
     ap.add_argument("--shrinkage_schedule", type=str, default=None)
@@ -539,17 +539,21 @@ def main():
             ap.error("--projection_lambda > 0 requires --optimizer adam")
         if not args.measure_subspaces:
             ap.error("--projection_lambda > 0 requires --measure_subspaces")
-    if args.update_control == "shrinkage":
-        if args.projection_lambda != 0.0:
-            ap.error("shrinkage mode requires --projection_lambda 0")
+    if args.update_control in {"shrinkage", "shrinkage_online"}:
         if args.controller != "fixed":
-            ap.error("shrinkage mode requires --controller fixed")
+            ap.error("shrinkage modes require --controller fixed")
         if args.optimizer != "adam":
-            ap.error("shrinkage mode requires --optimizer adam")
+            ap.error("shrinkage modes require --optimizer adam")
         if not args.measure_subspaces:
-            ap.error("shrinkage mode requires --measure_subspaces")
-        if not args.shrinkage_schedule:
-            ap.error("shrinkage mode requires --shrinkage_schedule")
+            ap.error("shrinkage modes require --measure_subspaces")
+        if args.update_control == "shrinkage":
+            if args.projection_lambda != 0.0:
+                ap.error("schedule-based shrinkage mode requires --projection_lambda 0")
+            if not args.shrinkage_schedule:
+                ap.error("shrinkage mode requires --shrinkage_schedule")
+        else:
+            if args.projection_lambda not in {0.0, 0.25, 0.5, 0.75, 1.0}:
+                ap.error("online shrinkage mode requires a supported --projection_lambda")
     elif args.shrinkage_schedule:
         ap.error("--shrinkage_schedule is only valid in shrinkage mode")
 
@@ -779,7 +783,13 @@ def main():
         for client, monitor in zip(clients, subspace_instrumentation.monitors):
             client.gradient_monitor = monitor
         if args.update_control == "shrinkage":
-            print("[Subspace] norm-matched scalar shrinkage enabled", flush=True)
+            print("[Subspace] frozen norm-matched scalar shrinkage enabled", flush=True)
+        elif args.update_control == "shrinkage_online":
+            print(
+                f"[Subspace] online energy-matching scalar shrinkage enabled "
+                f"(lambda={args.projection_lambda:g})",
+                flush=True,
+            )
         elif args.projection_lambda == 0.0:
             print("[Subspace] measurement-only instrumentation enabled (lambda=0)", flush=True)
         else:
@@ -804,6 +814,11 @@ def main():
         print(
             f"[Shrinkage] loaded {len(shrinkage_schedule)} frozen schedule entries "
             f"from {args.shrinkage_schedule}",
+            flush=True,
+        )
+    elif args.update_control == "shrinkage_online":
+        print(
+            "[Shrinkage] online energy-matching mode enabled; no frozen CSV schedule required",
             flush=True,
         )
 

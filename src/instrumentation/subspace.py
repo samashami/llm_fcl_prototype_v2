@@ -472,6 +472,70 @@ class _ModelMonitor:
                     "basis_rank": float("nan"),
                     "projection_lambda": 0.0,
                     "shrinkage_factor": factor,
+                    "counterfactual_projected_energy": float("nan"),
+                    "applied_control_energy": float(shrunk.square().sum().item()),
+                }
+            )
+            records.append(record)
+        return records
+
+    @torch.no_grad()
+    def online_shrink_parameter_updates(
+        self,
+        weights_before: Mapping[str, torch.Tensor],
+        projection_lambda: float,
+    ) -> List[Dict[str, float]]:
+        """Match the scalar energy retention of the corresponding projection treatment.
+
+        The update direction remains the original optimizer displacement; the basis only
+        informs the scalar factor used to match the same energy retention that the
+        counterfactual projection would have realized.
+        """
+        if not isinstance(projection_lambda, Real):
+            raise TypeError("projection_lambda must be a real number")
+        projection_lambda = float(projection_lambda)
+        if projection_lambda not in SUPPORTED_PROJECTION_LAMBDAS:
+            raise ValueError(
+                f"projection_lambda must be one of {SUPPORTED_PROJECTION_LAMBDAS}"
+            )
+
+        records = []
+        for target in self.targets:
+            weight_before = weights_before.get(target.name)
+            if weight_before is None:
+                continue
+            weight = self.modules[target.name].weight
+            raw = (weight.detach() - weight_before).reshape(weight.shape[0], -1)
+            phi = self.bank.basis(
+                target.name,
+                device=raw.device,
+                dtype=raw.dtype,
+            )
+            if phi is None:
+                continue
+
+            projected = soft_project_rows(raw, phi, projection_lambda)
+            raw_energy = float(raw.detach().square().sum().item())
+            counterfactual_projected_energy = float(projected.detach().square().sum().item())
+            retained_energy_fraction = (
+                counterfactual_projected_energy / raw_energy
+                if raw_energy > 0.0
+                else 1.0
+            )
+            retained_energy_fraction = min(1.0, max(0.0, retained_energy_fraction))
+            factor = math.sqrt(retained_energy_fraction)
+            shrunk = scalar_shrink_rows(raw, factor)
+            weight.copy_((weight_before.reshape(raw.shape[0], -1) + shrunk).reshape_as(weight))
+
+            record = realized_update_energy(raw, shrunk)
+            record.update(
+                {
+                    "layer": target.name,
+                    "basis_rank": int(phi.shape[1]),
+                    "projection_lambda": float(projection_lambda),
+                    "shrinkage_factor": factor,
+                    "counterfactual_projected_energy": counterfactual_projected_energy,
+                    "applied_control_energy": float(shrunk.square().sum().item()),
                 }
             )
             records.append(record)

@@ -140,6 +140,9 @@ class Client:
             shrinkage_active = (
                 update_control == "shrinkage" and self.gradient_monitor is not None
             )
+            online_shrinkage_active = (
+                update_control == "shrinkage_online" and self.gradient_monitor is not None
+            )
             shrinkage_layers = set()
             if shrinkage_active:
                 if shrinkage_factors is None:
@@ -156,12 +159,12 @@ class Client:
                 }
             if projection_active:
                 protected_weights = self.gradient_monitor.snapshot_protected_weights()
-            elif shrinkage_layers:
+            elif shrinkage_layers or online_shrinkage_active:
                 protected_weights = self.gradient_monitor.snapshot_target_weights(
-                    shrinkage_layers
+                    shrinkage_layers if shrinkage_layers else None
                 )
             self.optimizer.step()
-            if projection_active or shrinkage_active:
+            if projection_active or shrinkage_active or online_shrinkage_active:
                 self._optimizer_step += 1
             energy_records = []
             if projection_active and protected_weights:
@@ -171,6 +174,10 @@ class Client:
             elif shrinkage_layers:
                 energy_records = self.gradient_monitor.shrink_parameter_updates(
                     protected_weights, shrinkage_factors
+                )
+            elif online_shrinkage_active and protected_weights:
+                energy_records = self.gradient_monitor.online_shrink_parameter_updates(
+                    protected_weights, projection_lambda
                 )
             for record in energy_records:
                 record.update(
