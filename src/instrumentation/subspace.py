@@ -33,6 +33,8 @@ DEFAULT_RESNET18_TARGETS = (
 )
 
 SUPPORTED_PROJECTION_LAMBDAS = (0.0, 0.25, 0.5, 0.75, 1.0)
+ONLINE_SHRINKAGE_GUARD_RTOL = 1e-5
+ONLINE_SHRINKAGE_GUARD_ATOL = 1e-12
 
 
 class SubspaceBank:
@@ -517,6 +519,23 @@ class _ModelMonitor:
             projected = soft_project_rows(raw, phi, projection_lambda)
             raw_energy = float(raw.detach().square().sum().item())
             counterfactual_projected_energy = float(projected.detach().square().sum().item())
+            contractivity_tolerance = (
+                ONLINE_SHRINKAGE_GUARD_ATOL
+                + ONLINE_SHRINKAGE_GUARD_RTOL * abs(raw_energy)
+            )
+            if (
+                not math.isfinite(raw_energy)
+                or not math.isfinite(counterfactual_projected_energy)
+                or counterfactual_projected_energy
+                > raw_energy + contractivity_tolerance
+            ):
+                raise RuntimeError(
+                    "online shrinkage contractivity guard failed for layer "
+                    f"{target.name!r}: raw_energy={raw_energy!r}, "
+                    "counterfactual_projected_energy="
+                    f"{counterfactual_projected_energy!r}, "
+                    f"tolerance={contractivity_tolerance!r}; refusing to clamp"
+                )
             retained_energy_fraction = (
                 counterfactual_projected_energy / raw_energy
                 if raw_energy > 0.0
@@ -525,6 +544,25 @@ class _ModelMonitor:
             retained_energy_fraction = min(1.0, max(0.0, retained_energy_fraction))
             factor = math.sqrt(retained_energy_fraction)
             shrunk = scalar_shrink_rows(raw, factor)
+            applied_control_energy = float(shrunk.detach().square().sum().item())
+            if (
+                not math.isfinite(applied_control_energy)
+                or not math.isclose(
+                    applied_control_energy,
+                    counterfactual_projected_energy,
+                    rel_tol=ONLINE_SHRINKAGE_GUARD_RTOL,
+                    abs_tol=ONLINE_SHRINKAGE_GUARD_ATOL,
+                )
+            ):
+                raise RuntimeError(
+                    "online shrinkage energy-match guard failed for layer "
+                    f"{target.name!r}: applied_control_energy="
+                    f"{applied_control_energy!r}, "
+                    "counterfactual_projected_energy="
+                    f"{counterfactual_projected_energy!r}, "
+                    f"rtol={ONLINE_SHRINKAGE_GUARD_RTOL!r}, "
+                    f"atol={ONLINE_SHRINKAGE_GUARD_ATOL!r}"
+                )
             weight.copy_((weight_before.reshape(raw.shape[0], -1) + shrunk).reshape_as(weight))
 
             record = realized_update_energy(raw, shrunk)
@@ -535,7 +573,8 @@ class _ModelMonitor:
                     "projection_lambda": float(projection_lambda),
                     "shrinkage_factor": factor,
                     "counterfactual_projected_energy": counterfactual_projected_energy,
-                    "applied_control_energy": float(shrunk.square().sum().item()),
+                    "applied_control_energy": applied_control_energy,
+                    "online_shrinkage_guard_passed": True,
                 }
             )
             records.append(record)

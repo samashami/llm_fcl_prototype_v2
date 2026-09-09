@@ -209,6 +209,7 @@ class NormMatchedShrinkageChecks(unittest.TestCase):
             record["counterfactual_projected_energy"],
             places=12,
         )
+        self.assertIs(record["online_shrinkage_guard_passed"], True)
         self.assertTrue(torch.allclose(applied, expected_factor * raw, atol=1e-12, rtol=0.0))
         self.assertTrue(
             torch.allclose(
@@ -216,6 +217,66 @@ class NormMatchedShrinkageChecks(unittest.TestCase):
                 ((applied * raw).sum() / max(raw.square().sum(), 1e-12)) * raw,
                 atol=1e-12,
                 rtol=0.0,
+            )
+        )
+        instrumentation.close()
+
+    def test_online_shrinkage_rejects_non_contractive_malformed_phi(self):
+        model = TinyLinear().to(dtype=torch.float64)
+        instrumentation = SubspaceInstrumentation(
+            [model],
+            targets=(LayerTarget("fc", "fc"),),
+            samples_per_batch=1,
+            samples_per_phase=1,
+        )
+        monitor = instrumentation.monitors[0]
+        monitor.bank.bases["fc"] = torch.tensor(
+            [[2.0], [0.0], [0.0]], dtype=torch.float64
+        )
+        before = monitor.snapshot_target_weights()["fc"]
+        raw = torch.tensor(
+            [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=torch.float64
+        )
+        with torch.no_grad():
+            model.fc.weight.copy_(before + raw)
+
+        with self.assertRaisesRegex(RuntimeError, "contractivity guard failed"):
+            monitor.online_shrink_parameter_updates(
+                {"fc": before}, projection_lambda=1.0
+            )
+        self.assertTrue(torch.equal(model.fc.weight.detach(), before + raw))
+        instrumentation.close()
+
+    def test_online_shrinkage_applied_energy_passes_numerical_guard(self):
+        model = TinyLinear().to(dtype=torch.float32)
+        instrumentation = SubspaceInstrumentation(
+            [model],
+            targets=(LayerTarget("fc", "fc"),),
+            samples_per_batch=1,
+            samples_per_phase=1,
+        )
+        monitor = instrumentation.monitors[0]
+        generator = torch.Generator(device="cpu").manual_seed(53)
+        monitor.bank.bases["fc"] = torch.linalg.qr(
+            torch.randn(3, 2, generator=generator, dtype=torch.float32)
+        ).Q
+        before = monitor.snapshot_target_weights()["fc"]
+        raw = torch.tensor(
+            [[0.3, -0.7, 1.1], [-1.3, 0.2, 0.9]], dtype=torch.float32
+        )
+        with torch.no_grad():
+            model.fc.weight.copy_(before + raw)
+
+        record = monitor.online_shrink_parameter_updates(
+            {"fc": before}, projection_lambda=0.75
+        )[0]
+        self.assertIs(record["online_shrinkage_guard_passed"], True)
+        self.assertTrue(
+            math.isclose(
+                record["applied_control_energy"],
+                record["counterfactual_projected_energy"],
+                rel_tol=1e-5,
+                abs_tol=1e-12,
             )
         )
         instrumentation.close()
