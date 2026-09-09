@@ -12,6 +12,8 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.checkpointing import (
     CHECKPOINT_FORMAT_VERSION,
+    STAGE2B_HISTORICAL_CHECKPOINT_COMMIT,
+    STAGE2B_HISTORICAL_CODE_HASHES,
     branch_control_metadata,
     capture_rng_state,
     endpoint_state,
@@ -20,6 +22,7 @@ from src.checkpointing import (
     restore_rng_state,
     requires_endpoint_equality,
     save_checkpoint,
+    validate_checkpoint_code_compatibility,
     validate_determinism_gate,
     validate_resume_protocol,
     verify_endpoint_reference,
@@ -265,6 +268,10 @@ class CommonCheckpointChecks(unittest.TestCase):
         validate_resume_protocol(
             parent, {"seed": 42, "epochs": 5, "update_control": "shrinkage"}
         )
+        validate_resume_protocol(
+            parent,
+            {"seed": 42, "epochs": 5, "update_control": "shrinkage_online"},
+        )
         with self.assertRaisesRegex(RuntimeError, "outside update_control"):
             validate_resume_protocol(
                 parent, {"seed": 43, "epochs": 5, "update_control": "shrinkage"}
@@ -278,6 +285,9 @@ class CommonCheckpointChecks(unittest.TestCase):
                     "parent_run_id": "parent",
                     "executed_round": 5,
                     "source_checkpoint_sha256": "abc",
+                    "resume_code_compatibility": {
+                        "current_files_sha256": {"src/fl.py": "current"}
+                    },
                     "determinism_gate": {"passed": True},
                 }),
                 encoding="utf-8",
@@ -287,6 +297,7 @@ class CommonCheckpointChecks(unittest.TestCase):
                 parent_run_id="parent",
                 executed_round=5,
                 source_checkpoint_sha256="abc",
+                current_code_hashes={"src/fl.py": "current"},
             )
             self.assertTrue(document["determinism_gate"]["passed"])
             with self.assertRaisesRegex(RuntimeError, "another checkpoint"):
@@ -295,7 +306,82 @@ class CommonCheckpointChecks(unittest.TestCase):
                     parent_run_id="parent",
                     executed_round=1,
                     source_checkpoint_sha256="abc",
+                    current_code_hashes={"src/fl.py": "current"},
                 )
+
+            with self.assertRaisesRegex(RuntimeError, "different current code"):
+                validate_determinism_gate(
+                    gate_path,
+                    parent_run_id="parent",
+                    executed_round=5,
+                    source_checkpoint_sha256="abc",
+                    current_code_hashes={"src/fl.py": "changed"},
+                )
+
+    def test_stage2b_historical_code_exception_is_explicit_and_scoped(self):
+        checkpoint_manifest = {
+            "code": {
+                "git_commit": STAGE2B_HISTORICAL_CHECKPOINT_COMMIT,
+                "files_sha256": dict(STAGE2B_HISTORICAL_CODE_HASHES),
+            }
+        }
+        current_manifest = {
+            "code": {
+                "git_commit": "current",
+                "files_sha256": {"src/fl.py": "current"},
+            }
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "checksums differ"):
+            validate_checkpoint_code_compatibility(
+                checkpoint_manifest, current_manifest
+            )
+        compatibility = validate_checkpoint_code_compatibility(
+            checkpoint_manifest,
+            current_manifest,
+            allow_stage2b_historical_checkpoint=True,
+        )
+        self.assertTrue(compatibility["exception_used"])
+        self.assertEqual(
+            compatibility["checkpoint_git_commit"],
+            STAGE2B_HISTORICAL_CHECKPOINT_COMMIT,
+        )
+        self.assertEqual(
+            compatibility["current_files_sha256"], {"src/fl.py": "current"}
+        )
+
+    def test_stage2b_exception_rejects_wrong_commit_or_source_hashes(self):
+        current_manifest = {
+            "code": {"git_commit": "current", "files_sha256": {"x": "new"}}
+        }
+        wrong_commit = {
+            "code": {
+                "git_commit": "not-the-stage2b-parent",
+                "files_sha256": dict(STAGE2B_HISTORICAL_CODE_HASHES),
+            }
+        }
+        with self.assertRaisesRegex(RuntimeError, "rejected checkpoint commit"):
+            validate_checkpoint_code_compatibility(
+                wrong_commit,
+                current_manifest,
+                allow_stage2b_historical_checkpoint=True,
+            )
+
+        wrong_hashes = {
+            "code": {
+                "git_commit": STAGE2B_HISTORICAL_CHECKPOINT_COMMIT,
+                "files_sha256": {
+                    **STAGE2B_HISTORICAL_CODE_HASHES,
+                    "src/fl.py": "modified",
+                },
+            }
+        }
+        with self.assertRaisesRegex(RuntimeError, "rejected checkpoint source hashes"):
+            validate_checkpoint_code_compatibility(
+                wrong_hashes,
+                current_manifest,
+                allow_stage2b_historical_checkpoint=True,
+            )
 
     def test_projection_and_shrinkage_load_same_start_state_hash(self):
         generator = torch.Generator().manual_seed(29)

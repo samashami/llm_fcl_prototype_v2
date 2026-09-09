@@ -37,6 +37,7 @@ from src.checkpointing import (
     restore_rng_state,
     requires_endpoint_equality,
     save_checkpoint,
+    validate_checkpoint_code_compatibility,
     validate_determinism_gate,
     validate_resume_protocol,
     verify_endpoint_reference,
@@ -451,6 +452,14 @@ def main():
     ap.add_argument("--common_checkpoint_dir", type=str, default=None)
     ap.add_argument("--resume_checkpoint", type=str, default=None)
     ap.add_argument(
+        "--allow_stage2b_historical_checkpoint_code",
+        action="store_true",
+        help=(
+            "allow only the audited aa3a4b6 Stage 2B checkpoint code hashes; "
+            "all other resume checks remain enforced"
+        ),
+    )
+    ap.add_argument(
         "--branch_local_epochs",
         type=int,
         default=None,
@@ -516,6 +525,7 @@ def main():
         or args.determinism_reference
         or args.determinism_gate_dir
         or args.branch_local_epochs is not None
+        or args.allow_stage2b_historical_checkpoint_code
     ):
         ap.error(
             "branch resume options "
@@ -823,10 +833,16 @@ def main():
         )
 
     current_manifest = protocol_manifest(protocol, code_paths) if branching_mode else None
+    resume_code_compatibility = None
     if resume_payload is not None:
         checkpoint_manifest = resume_payload["manifest"]
-        if checkpoint_manifest["code"]["files_sha256"] != current_manifest["code"]["files_sha256"]:
-            raise RuntimeError("checkpoint code-file checksums differ from current code")
+        resume_code_compatibility = validate_checkpoint_code_compatibility(
+            checkpoint_manifest,
+            current_manifest,
+            allow_stage2b_historical_checkpoint=(
+                args.allow_stage2b_historical_checkpoint_code
+            ),
+        )
         environment_keys = (
             "python", "platform", "torch", "numpy", "cuda_runtime", "cudnn",
             "cuda_device_count", "cuda_devices", "cudnn_deterministic",
@@ -1016,6 +1032,7 @@ def main():
                 parent_run_id=parent_run_id,
                 executed_round=start_round,
                 source_checkpoint_sha256=source_checkpoint_sha256,
+                current_code_hashes=current_manifest["code"]["files_sha256"],
             )
 
     stop_round = start_round + 1 if args.one_round else args.rounds
@@ -1575,6 +1592,7 @@ def main():
                 "branch_run_id": run_id,
                 "executed_round": int(r),
                 "projection_lambda": float(args.projection_lambda),
+                "resume_code_compatibility": resume_code_compatibility,
                 **branch_control_metadata(
                     update_control=args.update_control,
                     branch_local_epochs=args.branch_local_epochs,

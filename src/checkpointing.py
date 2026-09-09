@@ -18,6 +18,16 @@ import torch
 
 
 CHECKPOINT_FORMAT_VERSION = 1
+STAGE2B_HISTORICAL_CHECKPOINT_COMMIT = (
+    "aa3a4b641127c84e378abecd29f2bc0fb6a5af4d"
+)
+STAGE2B_HISTORICAL_CODE_HASHES = {
+    "src/run_llm_fcl_controller.py": "923f9f3180cdc10af5154be495e7f59d204975a519981aa89acaddc60cfc92ae",
+    "src/checkpointing.py": "6cbb886fe3a93643e6fb9f3cfe88aacb79821d2586cb2549e4f77bd7fbcd9969",
+    "src/fl.py": "3d5cdde29e456aeb1134adb171fd4b6c3d7381a8f80b57cc082ecd1d15da7cc6",
+    "src/strategies/replay.py": "55f9505680677d98b3adc836b2624de106fdb19b72fed515534350bc8c418f61",
+    "src/instrumentation/subspace.py": "828ce024ccb5d7b459807ccd33e27373eeb61d1504354b188426ac0df01717ce",
+}
 
 
 def sha256_file(path: os.PathLike[str] | str) -> str:
@@ -263,6 +273,46 @@ def validate_resume_protocol(
         )
 
 
+def validate_checkpoint_code_compatibility(
+    checkpoint_manifest: Mapping[str, Any],
+    current_manifest: Mapping[str, Any],
+    *,
+    allow_stage2b_historical_checkpoint: bool = False,
+) -> Dict[str, Any]:
+    """Validate code hashes, with one explicit exception for the Stage 2B parent."""
+    checkpoint_code = checkpoint_manifest.get("code", {})
+    current_code = current_manifest.get("code", {})
+    checkpoint_hashes = dict(checkpoint_code.get("files_sha256", {}))
+    current_hashes = dict(current_code.get("files_sha256", {}))
+    checkpoint_commit = checkpoint_code.get("git_commit")
+    current_commit = current_code.get("git_commit")
+    hashes_match = checkpoint_hashes == current_hashes
+
+    compatibility = {
+        "exception_used": False,
+        "checkpoint_git_commit": checkpoint_commit,
+        "current_git_commit": current_commit,
+        "checkpoint_files_sha256": checkpoint_hashes,
+        "current_files_sha256": current_hashes,
+    }
+    if hashes_match:
+        return compatibility
+    if not allow_stage2b_historical_checkpoint:
+        raise RuntimeError("checkpoint code-file checksums differ from current code")
+    if checkpoint_commit != STAGE2B_HISTORICAL_CHECKPOINT_COMMIT:
+        raise RuntimeError(
+            "Stage 2B historical-code exception rejected checkpoint commit: "
+            f"expected {STAGE2B_HISTORICAL_CHECKPOINT_COMMIT!r}, "
+            f"found {checkpoint_commit!r}"
+        )
+    if checkpoint_hashes != STAGE2B_HISTORICAL_CODE_HASHES:
+        raise RuntimeError(
+            "Stage 2B historical-code exception rejected checkpoint source hashes"
+        )
+    compatibility["exception_used"] = True
+    return compatibility
+
+
 def requires_endpoint_equality(update_control: str, projection_lambda: float) -> bool:
     """Only the no-treatment projection branch is an exact parent continuation."""
     return update_control == "projection" and projection_lambda == 0.0
@@ -274,6 +324,7 @@ def validate_determinism_gate(
     parent_run_id: str,
     executed_round: int,
     source_checkpoint_sha256: str,
+    current_code_hashes: Mapping[str, str],
 ) -> Dict[str, Any]:
     """Validate the one exact-continuation gate relevant to a resumed checkpoint."""
     gate_path = Path(gate_path)
@@ -292,6 +343,13 @@ def validate_determinism_gate(
         raise RuntimeError(
             "branch blocked: determinism gate belongs to another checkpoint: "
             f"expected={expected}, found={actual}"
+        )
+    gate_code_hashes = document.get("resume_code_compatibility", {}).get(
+        "current_files_sha256"
+    )
+    if gate_code_hashes != dict(current_code_hashes):
+        raise RuntimeError(
+            "branch blocked: determinism gate was produced by different current code"
         )
     return document
 
