@@ -30,6 +30,7 @@ from src.checkpointing import (
     branch_control_metadata,
     capture_rng_state,
     endpoint_state,
+    fixed_compute_reference_metadata,
     fingerprint_sha256,
     load_checkpoint,
     model_state_sha256,
@@ -39,6 +40,8 @@ from src.checkpointing import (
     save_checkpoint,
     validate_checkpoint_code_compatibility,
     validate_determinism_gate,
+    validate_fixed_compute_counts,
+    validate_fixed_compute_reference,
     validate_resume_protocol,
     verify_endpoint_reference,
     write_endpoint_reference,
@@ -477,6 +480,15 @@ def main():
         help="parent endpoint JSON required for a resumed lambda=0 branch",
     )
     ap.add_argument(
+        "--create_fixed_compute_determinism_reference",
+        type=str,
+        default=None,
+        help=(
+            "write a new fixed-compute lambda=0 endpoint reference at this path; "
+            "a separate rerun against it is required to create a PASS gate"
+        ),
+    )
+    ap.add_argument(
         "--determinism_gate_dir",
         type=str,
         default=None,
@@ -511,8 +523,24 @@ def main():
             args.update_control == "projection"
             and args.projection_lambda == 0.0
             and not args.determinism_reference
+            and not args.create_fixed_compute_determinism_reference
         ):
             ap.error("a resumed lambda=0 branch requires --determinism_reference")
+        if args.create_fixed_compute_determinism_reference:
+            if (
+                args.update_control != "projection"
+                or args.projection_lambda != 0.0
+                or args.branch_local_epochs is None
+            ):
+                ap.error(
+                    "--create_fixed_compute_determinism_reference requires "
+                    "projection lambda=0 and --branch_local_epochs"
+                )
+            if args.determinism_reference or args.determinism_gate_dir:
+                ap.error(
+                    "fixed-compute reference creation cannot use an existing "
+                    "reference or determinism gate"
+                )
         if (
             not requires_endpoint_equality(
                 args.update_control, args.projection_lambda
@@ -525,6 +553,7 @@ def main():
         or args.determinism_reference
         or args.determinism_gate_dir
         or args.branch_local_epochs is not None
+        or args.create_fixed_compute_determinism_reference
         or args.allow_stage2b_historical_checkpoint_code
     ):
         ap.error(
@@ -949,6 +978,7 @@ def main():
     start_round = 0
     source_checkpoint_sha256 = None
     starting_state_hash = None
+    fixed_compute_reference_document = None
     if resume_payload is not None:
         global_model.load_state_dict(resume_payload["global_model"])
         if len(resume_payload["clients"]) != len(clients):
@@ -1001,26 +1031,39 @@ def main():
             flush=True,
         )
         if requires_endpoint_equality(args.update_control, args.projection_lambda):
-            reference_document = json.loads(
-                Path(args.determinism_reference).read_text(encoding="utf-8")
-            )
-            reference_identity = {
-                "parent_run_id": reference_document.get("parent_run_id"),
-                "executed_round": reference_document.get("executed_round"),
-                "source_checkpoint_sha256": reference_document.get(
-                    "source_checkpoint_sha256"
-                ),
-            }
-            expected_identity = {
-                "parent_run_id": parent_run_id,
-                "executed_round": start_round,
-                "source_checkpoint_sha256": source_checkpoint_sha256,
-            }
-            if reference_identity != expected_identity:
-                raise RuntimeError(
-                    "determinism reference does not belong to this checkpoint: "
-                    f"expected={expected_identity}, found={reference_identity}"
-                )
+            if not args.create_fixed_compute_determinism_reference:
+                if args.branch_local_epochs is not None:
+                    fixed_compute_reference_document = validate_fixed_compute_reference(
+                        args.determinism_reference,
+                        parent_run_id=parent_run_id,
+                        executed_round=start_round,
+                        source_checkpoint_sha256=source_checkpoint_sha256,
+                        starting_state_hash=starting_state_hash,
+                        protocol=protocol,
+                        branch_local_epochs=args.branch_local_epochs,
+                        current_code_hashes=current_manifest["code"]["files_sha256"],
+                    )
+                else:
+                    reference_document = json.loads(
+                        Path(args.determinism_reference).read_text(encoding="utf-8")
+                    )
+                    reference_identity = {
+                        "parent_run_id": reference_document.get("parent_run_id"),
+                        "executed_round": reference_document.get("executed_round"),
+                        "source_checkpoint_sha256": reference_document.get(
+                            "source_checkpoint_sha256"
+                        ),
+                    }
+                    expected_identity = {
+                        "parent_run_id": parent_run_id,
+                        "executed_round": start_round,
+                        "source_checkpoint_sha256": source_checkpoint_sha256,
+                    }
+                    if reference_identity != expected_identity:
+                        raise RuntimeError(
+                            "determinism reference does not belong to this checkpoint: "
+                            f"expected={expected_identity}, found={reference_identity}"
+                        )
         else:
             gate_dir = Path(args.determinism_gate_dir)
             gate_path = (
@@ -1033,6 +1076,7 @@ def main():
                 executed_round=start_round,
                 source_checkpoint_sha256=source_checkpoint_sha256,
                 current_code_hashes=current_manifest["code"]["files_sha256"],
+                branch_local_epochs=args.branch_local_epochs,
             )
 
     stop_round = start_round + 1 if args.one_round else args.rounds
@@ -1580,6 +1624,13 @@ def main():
 
         if args.resume_checkpoint:
             endpoint_hash = fingerprint_sha256(endpoint)
+            branch_control = branch_control_metadata(
+                update_control=args.update_control,
+                branch_local_epochs=args.branch_local_epochs,
+                shrinkage_schedule=args.shrinkage_schedule,
+                client_epoch_counts=branch_client_epoch_counts,
+                client_optimizer_step_counts=branch_client_optimizer_step_counts,
+            )
             branch_metadata = {
                 "source_checkpoint": str(Path(args.resume_checkpoint)),
                 "source_checkpoint_sha256": source_checkpoint_sha256,
@@ -1593,20 +1644,53 @@ def main():
                 "executed_round": int(r),
                 "projection_lambda": float(args.projection_lambda),
                 "resume_code_compatibility": resume_code_compatibility,
-                **branch_control_metadata(
-                    update_control=args.update_control,
-                    branch_local_epochs=args.branch_local_epochs,
-                    shrinkage_schedule=args.shrinkage_schedule,
-                    client_epoch_counts=branch_client_epoch_counts,
-                    client_optimizer_step_counts=branch_client_optimizer_step_counts,
-                ),
+                **branch_control,
                 "determinism_gate": None,
             }
-            if requires_endpoint_equality(
+            if args.create_fixed_compute_determinism_reference:
+                reference = write_endpoint_reference(
+                    args.create_fixed_compute_determinism_reference,
+                    endpoint,
+                    fixed_compute_reference_metadata(
+                        parent_run_id=parent_run_id,
+                        executed_round=r,
+                        source_checkpoint=args.resume_checkpoint,
+                        source_checkpoint_sha256=source_checkpoint_sha256,
+                        starting_state_hash=starting_state_hash,
+                        protocol=protocol,
+                        current_code_hashes=current_manifest["code"]["files_sha256"],
+                        resume_code_compatibility=resume_code_compatibility,
+                        branch_control=branch_control,
+                    ),
+                )
+                branch_metadata["fixed_compute_determinism_reference"] = {
+                    "created": True,
+                    "path": str(Path(args.create_fixed_compute_determinism_reference)),
+                    "endpoint_state_hash": reference["endpoint_state_hash"],
+                }
+                print(
+                    "[Determinism] wrote fixed-compute reference; rerun lambda=0 "
+                    "against it to create a PASS gate",
+                    flush=True,
+                )
+            elif requires_endpoint_equality(
                 args.update_control, args.projection_lambda
             ):
+                if fixed_compute_reference_document is not None:
+                    validate_fixed_compute_counts(
+                        fixed_compute_reference_document, branch_control
+                    )
                 gate = verify_endpoint_reference(args.determinism_reference, endpoint)
                 branch_metadata["determinism_gate"] = gate
+                if fixed_compute_reference_document is not None:
+                    branch_metadata["fixed_compute_determinism_reference"] = {
+                        "verified": bool(gate["passed"]),
+                        "path": str(Path(args.determinism_reference)),
+                        "branch_local_epochs": args.branch_local_epochs,
+                        "endpoint_state_hash": fixed_compute_reference_document[
+                            "endpoint_state_hash"
+                        ],
+                    }
                 report_name = (
                     f"determinism_round_{r:02d}_lambda000_"
                     f"{'PASS' if gate['passed'] else 'FAIL'}.json"

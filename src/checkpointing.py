@@ -325,6 +325,7 @@ def validate_determinism_gate(
     executed_round: int,
     source_checkpoint_sha256: str,
     current_code_hashes: Mapping[str, str],
+    branch_local_epochs: int | None = None,
 ) -> Dict[str, Any]:
     """Validate the one exact-continuation gate relevant to a resumed checkpoint."""
     gate_path = Path(gate_path)
@@ -351,6 +352,16 @@ def validate_determinism_gate(
         raise RuntimeError(
             "branch blocked: determinism gate was produced by different current code"
         )
+    if branch_local_epochs is not None:
+        fixed_compute = document.get("fixed_compute_determinism_reference", {})
+        if (
+            not fixed_compute.get("verified", False)
+            or fixed_compute.get("branch_local_epochs") != int(branch_local_epochs)
+        ):
+            raise RuntimeError(
+                "branch blocked: fixed-compute treatment requires a PASS gate "
+                "from a verified fixed-compute determinism reference"
+            )
     return document
 
 
@@ -379,6 +390,94 @@ def branch_control_metadata(
             for key, value in client_optimizer_step_counts.items()
         },
     }
+
+
+def fixed_compute_reference_metadata(
+    *,
+    parent_run_id: str,
+    executed_round: int,
+    source_checkpoint: os.PathLike[str] | str,
+    source_checkpoint_sha256: str,
+    starting_state_hash: str,
+    protocol: Mapping[str, Any],
+    current_code_hashes: Mapping[str, str],
+    resume_code_compatibility: Mapping[str, Any],
+    branch_control: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Provenance required for a fixed-compute continuation reference."""
+    return {
+        "reference_type": "fixed_compute_determinism_reference",
+        "reference_format_version": 1,
+        "parent_run_id": str(parent_run_id),
+        "executed_round": int(executed_round),
+        "projection_lambda": 0.0,
+        "source_checkpoint": str(Path(source_checkpoint)),
+        "source_checkpoint_sha256": str(source_checkpoint_sha256),
+        "starting_state_hash": str(starting_state_hash),
+        "protocol": dict(protocol),
+        "current_code_hashes": dict(current_code_hashes),
+        "resume_code_compatibility": dict(resume_code_compatibility),
+        **dict(branch_control),
+        "excluded_nondeterministic_summary_fields": [
+            "basis_construction_seconds",
+            "measurement_overhead_seconds",
+        ],
+    }
+
+
+def validate_fixed_compute_reference(
+    reference_path: os.PathLike[str] | str,
+    *,
+    parent_run_id: str,
+    executed_round: int,
+    source_checkpoint_sha256: str,
+    starting_state_hash: str,
+    protocol: Mapping[str, Any],
+    branch_local_epochs: int,
+    current_code_hashes: Mapping[str, str],
+) -> Dict[str, Any]:
+    """Reject a reference that was not made for this exact fixed-compute branch."""
+    path = Path(reference_path)
+    if not path.is_file():
+        raise RuntimeError(f"fixed-compute determinism reference is missing: {path}")
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if document.get("reference_type") != "fixed_compute_determinism_reference":
+        raise RuntimeError("determinism reference is not a fixed-compute reference")
+    expected = {
+        "parent_run_id": str(parent_run_id),
+        "executed_round": int(executed_round),
+        "source_checkpoint_sha256": str(source_checkpoint_sha256),
+        "starting_state_hash": str(starting_state_hash),
+        "protocol": dict(protocol),
+        "branch_local_epochs": int(branch_local_epochs),
+        "update_control": "projection",
+        "projection_lambda": 0.0,
+        "current_code_hashes": dict(current_code_hashes),
+    }
+    actual = {key: document.get(key) for key in expected}
+    if actual != expected:
+        raise RuntimeError(
+            "fixed-compute determinism reference provenance differs: "
+            f"expected={expected}, found={actual}"
+        )
+    return document
+
+
+def validate_fixed_compute_counts(
+    reference: Mapping[str, Any],
+    branch_control: Mapping[str, Any],
+) -> None:
+    """Ensure the verification rerun executed the reference's exact compute."""
+    expected = {
+        key: reference.get(key)
+        for key in ("per_client_epoch_counts", "per_client_optimizer_step_counts")
+    }
+    actual = {key: branch_control.get(key) for key in expected}
+    if actual != expected:
+        raise RuntimeError(
+            "fixed-compute determinism reference compute counts differ: "
+            f"expected={expected}, found={actual}"
+        )
 
 
 def endpoint_state(

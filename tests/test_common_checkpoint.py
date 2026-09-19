@@ -17,6 +17,7 @@ from src.checkpointing import (
     branch_control_metadata,
     capture_rng_state,
     endpoint_state,
+    fixed_compute_reference_metadata,
     flatten_fingerprints,
     load_checkpoint,
     restore_rng_state,
@@ -24,6 +25,8 @@ from src.checkpointing import (
     save_checkpoint,
     validate_checkpoint_code_compatibility,
     validate_determinism_gate,
+    validate_fixed_compute_counts,
+    validate_fixed_compute_reference,
     validate_resume_protocol,
     verify_endpoint_reference,
     write_endpoint_reference,
@@ -317,6 +320,125 @@ class CommonCheckpointChecks(unittest.TestCase):
                     source_checkpoint_sha256="abc",
                     current_code_hashes={"src/fl.py": "changed"},
                 )
+
+    def test_fixed_compute_reference_creation_and_exact_verification(self):
+        model, client, instrumentation = make_runtime()
+        endpoint = endpoint_state(
+            model, [client], instrumentation, {"round": 1, "accuracy": 50.0}
+        )
+        protocol = {"seed": 42, "epochs": 5, "update_control": "projection"}
+        code_hashes = {"src/fl.py": "current"}
+        branch_control = branch_control_metadata(
+            update_control="projection",
+            branch_local_epochs=3,
+            shrinkage_schedule=None,
+            client_epoch_counts={0: 3},
+            client_optimizer_step_counts={0: 12},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            reference_path = Path(directory) / "fixed_compute_reference.json"
+            write_endpoint_reference(
+                reference_path,
+                endpoint,
+                fixed_compute_reference_metadata(
+                    parent_run_id="parent",
+                    executed_round=1,
+                    source_checkpoint="pre_round_01.pt",
+                    source_checkpoint_sha256="checkpoint-sha",
+                    starting_state_hash="starting-state",
+                    protocol=protocol,
+                    current_code_hashes=code_hashes,
+                    resume_code_compatibility={"exception_used": True},
+                    branch_control=branch_control,
+                ),
+            )
+            reference = validate_fixed_compute_reference(
+                reference_path,
+                parent_run_id="parent",
+                executed_round=1,
+                source_checkpoint_sha256="checkpoint-sha",
+                starting_state_hash="starting-state",
+                protocol=protocol,
+                branch_local_epochs=3,
+                current_code_hashes=code_hashes,
+            )
+            validate_fixed_compute_counts(reference, branch_control)
+            self.assertTrue(verify_endpoint_reference(reference_path, endpoint)["passed"])
+            self.assertEqual(reference["per_client_epoch_counts"], {"0": 3})
+            self.assertEqual(reference["per_client_optimizer_step_counts"], {"0": 12})
+            self.assertEqual(reference["current_code_hashes"], code_hashes)
+            with self.assertRaisesRegex(RuntimeError, "compute counts differ"):
+                validate_fixed_compute_counts(
+                    reference,
+                    {**branch_control, "per_client_optimizer_step_counts": {"0": 11}},
+                )
+        instrumentation.close()
+
+    def test_fixed_compute_reference_rejects_wrong_checkpoint_or_protocol(self):
+        model, client, instrumentation = make_runtime()
+        endpoint = endpoint_state(model, [client], instrumentation, {"round": 1})
+        protocol = {"seed": 42, "epochs": 5, "update_control": "projection"}
+        control = branch_control_metadata(
+            update_control="projection", branch_local_epochs=3,
+            shrinkage_schedule=None, client_epoch_counts={0: 3},
+            client_optimizer_step_counts={0: 12},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            reference_path = Path(directory) / "reference.json"
+            write_endpoint_reference(reference_path, endpoint, fixed_compute_reference_metadata(
+                parent_run_id="parent", executed_round=1,
+                source_checkpoint="pre_round_01.pt", source_checkpoint_sha256="sha",
+                starting_state_hash="state", protocol=protocol,
+                current_code_hashes={"src/fl.py": "current"},
+                resume_code_compatibility={}, branch_control=control,
+            ))
+            common = dict(
+                reference_path=reference_path, parent_run_id="parent", executed_round=1,
+                starting_state_hash="state", branch_local_epochs=3,
+                current_code_hashes={"src/fl.py": "current"},
+            )
+            with self.assertRaisesRegex(RuntimeError, "provenance differs"):
+                validate_fixed_compute_reference(
+                    source_checkpoint_sha256="wrong", protocol=protocol, **common
+                )
+            with self.assertRaisesRegex(RuntimeError, "provenance differs"):
+                validate_fixed_compute_reference(
+                    source_checkpoint_sha256="sha",
+                    protocol={**protocol, "seed": 43},
+                    **common,
+                )
+        instrumentation.close()
+
+    def test_fixed_compute_treatment_gate_requires_verified_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gate_path = Path(directory) / "gate.json"
+            gate = {
+                "parent_run_id": "parent",
+                "executed_round": 1,
+                "source_checkpoint_sha256": "sha",
+                "resume_code_compatibility": {
+                    "current_files_sha256": {"src/fl.py": "current"}
+                },
+                "determinism_gate": {"passed": True},
+            }
+            gate_path.write_text(json.dumps(gate), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "fixed-compute treatment"):
+                validate_determinism_gate(
+                    gate_path, parent_run_id="parent", executed_round=1,
+                    source_checkpoint_sha256="sha",
+                    current_code_hashes={"src/fl.py": "current"},
+                    branch_local_epochs=3,
+                )
+            gate["fixed_compute_determinism_reference"] = {
+                "verified": True, "branch_local_epochs": 3,
+            }
+            gate_path.write_text(json.dumps(gate), encoding="utf-8")
+            self.assertTrue(validate_determinism_gate(
+                gate_path, parent_run_id="parent", executed_round=1,
+                source_checkpoint_sha256="sha",
+                current_code_hashes={"src/fl.py": "current"},
+                branch_local_epochs=3,
+            )["determinism_gate"]["passed"])
 
     def test_stage2b_historical_code_exception_is_explicit_and_scoped(self):
         checkpoint_manifest = {
