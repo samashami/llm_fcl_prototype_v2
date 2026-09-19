@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Dataset
 from src.checkpointing import (
     CHECKPOINT_FORMAT_VERSION,
     RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES,
+    RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT,
     RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_SHA256,
     RECONSTRUCTED_STAGE2_EARLY_NEXT_ROUND,
     RECONSTRUCTED_STAGE2_EARLY_PARENT_RUN_ID,
@@ -516,7 +517,7 @@ class CommonCheckpointChecks(unittest.TestCase):
     def test_reconstructed_early_checkpoint_exception_requires_full_provenance(self):
         checkpoint_manifest = {
             "code": {
-                "git_commit": None,
+                "git_commit": RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT,
                 "files_sha256": dict(RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES),
             }
         }
@@ -548,7 +549,7 @@ class CommonCheckpointChecks(unittest.TestCase):
         }
         exact_manifest = {
             "code": {
-                "git_commit": None,
+                "git_commit": RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT,
                 "files_sha256": dict(RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES),
             }
         }
@@ -561,7 +562,13 @@ class CommonCheckpointChecks(unittest.TestCase):
         }
         with self.assertRaisesRegex(RuntimeError, "rejected checkpoint manifest git commit"):
             validate_checkpoint_code_compatibility(
-                {"code": {**exact_manifest["code"], "git_commit": "8b823b"}},
+                {"code": {**exact_manifest["code"], "git_commit": None}},
+                current_manifest,
+                **common,
+            )
+        with self.assertRaisesRegex(RuntimeError, "rejected checkpoint manifest git commit"):
+            validate_checkpoint_code_compatibility(
+                {"code": {**exact_manifest["code"], "git_commit": "wrong"}},
                 current_manifest,
                 **common,
             )

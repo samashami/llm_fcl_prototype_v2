@@ -35,6 +35,9 @@ RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES = {
     "src/strategies/replay.py": "55f9505680677d98b3adc836b2624de106fdb19b72fed515534350bc8c418f61",
     "src/instrumentation/subspace.py": "84bd513afcd826a0928d24d5d727c3a51f1029e52409a4e3e61d75b57cb80ad7",
 }
+RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT = (
+    "8b823b45d40fcdd830cd5b0a6879c524d166be08"
+)
 RECONSTRUCTED_STAGE2_EARLY_STARTING_STATE_HASH = (
     "fb3611e31e499090a5f7f2064a8162ad92d0af6708431d63ce924c75096bb0c5"
 )
@@ -329,7 +332,7 @@ def validate_checkpoint_code_compatibility(
         compatibility["exception_name"] = "stage2b_historical_checkpoint_code"
         return compatibility
     if allow_reconstructed_stage2_early_checkpoint:
-        if checkpoint_commit is not None:
+        if checkpoint_commit != RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT:
             raise RuntimeError(
                 "reconstructed Stage 2 early-checkpoint exception rejected "
                 "checkpoint manifest git commit"
