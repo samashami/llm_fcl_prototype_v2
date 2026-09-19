@@ -12,6 +12,10 @@ from torch.utils.data import DataLoader, Dataset
 
 from src.checkpointing import (
     CHECKPOINT_FORMAT_VERSION,
+    RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES,
+    RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT,
+    RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_SHA256,
+    RECONSTRUCTED_STAGE2_EARLY_STARTING_STATE_HASH,
     STAGE2B_HISTORICAL_CHECKPOINT_COMMIT,
     STAGE2B_HISTORICAL_CODE_HASHES,
     branch_control_metadata,
@@ -465,6 +469,9 @@ class CommonCheckpointChecks(unittest.TestCase):
         )
         self.assertTrue(compatibility["exception_used"])
         self.assertEqual(
+            compatibility["exception_name"], "stage2b_historical_checkpoint_code"
+        )
+        self.assertEqual(
             compatibility["checkpoint_git_commit"],
             STAGE2B_HISTORICAL_CHECKPOINT_COMMIT,
         )
@@ -503,6 +510,81 @@ class CommonCheckpointChecks(unittest.TestCase):
                 wrong_hashes,
                 current_manifest,
                 allow_stage2b_historical_checkpoint=True,
+            )
+
+    def test_reconstructed_early_checkpoint_exception_requires_full_provenance(self):
+        checkpoint_manifest = {
+            "code": {
+                "git_commit": RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT,
+                "files_sha256": dict(RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES),
+            }
+        }
+        current_manifest = {
+            "code": {"git_commit": "current", "files_sha256": {"x": "new"}}
+        }
+        compatibility = validate_checkpoint_code_compatibility(
+            checkpoint_manifest,
+            current_manifest,
+            allow_reconstructed_stage2_early_checkpoint=True,
+            checkpoint_sha256=RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_SHA256,
+            starting_state_hash=RECONSTRUCTED_STAGE2_EARLY_STARTING_STATE_HASH,
+        )
+        self.assertTrue(compatibility["exception_used"])
+        self.assertEqual(
+            compatibility["exception_name"],
+            "reconstructed_stage2_early_checkpoint_code",
+        )
+        self.assertEqual(
+            compatibility["checkpoint_files_sha256"],
+            RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES,
+        )
+
+    def test_reconstructed_early_checkpoint_exception_rejects_wrong_provenance(self):
+        current_manifest = {
+            "code": {"git_commit": "current", "files_sha256": {"x": "new"}}
+        }
+        exact_manifest = {
+            "code": {
+                "git_commit": RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT,
+                "files_sha256": dict(RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES),
+            }
+        }
+        common = {
+            "allow_reconstructed_stage2_early_checkpoint": True,
+            "checkpoint_sha256": RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_SHA256,
+            "starting_state_hash": RECONSTRUCTED_STAGE2_EARLY_STARTING_STATE_HASH,
+        }
+        with self.assertRaisesRegex(RuntimeError, "rejected checkpoint commit"):
+            validate_checkpoint_code_compatibility(
+                {"code": {**exact_manifest["code"], "git_commit": "wrong"}},
+                current_manifest,
+                **common,
+            )
+        with self.assertRaisesRegex(RuntimeError, "rejected checkpoint source hashes"):
+            validate_checkpoint_code_compatibility(
+                {
+                    "code": {
+                        **exact_manifest["code"],
+                        "files_sha256": {
+                            **RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES,
+                            "src/fl.py": "altered",
+                        },
+                    }
+                },
+                current_manifest,
+                **common,
+            )
+        with self.assertRaisesRegex(RuntimeError, "rejected checkpoint SHA256"):
+            validate_checkpoint_code_compatibility(
+                exact_manifest,
+                current_manifest,
+                **{**common, "checkpoint_sha256": "another-checkpoint"},
+            )
+        with self.assertRaisesRegex(RuntimeError, "rejected starting-state hash"):
+            validate_checkpoint_code_compatibility(
+                exact_manifest,
+                current_manifest,
+                **{**common, "starting_state_hash": "another-state"},
             )
 
     def test_projection_and_shrinkage_load_same_start_state_hash(self):

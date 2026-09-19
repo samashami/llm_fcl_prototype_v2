@@ -463,6 +463,14 @@ def main():
         ),
     )
     ap.add_argument(
+        "--allow_reconstructed_stage2_early_checkpoint_code",
+        action="store_true",
+        help=(
+            "allow only the audited reconstructed Stage 2 early checkpoint "
+            "(commit, source hashes, SHA256, and starting-state hash are all checked)"
+        ),
+    )
+    ap.add_argument(
         "--branch_local_epochs",
         type=int,
         default=None,
@@ -555,6 +563,7 @@ def main():
         or args.branch_local_epochs is not None
         or args.create_fixed_compute_determinism_reference
         or args.allow_stage2b_historical_checkpoint_code
+        or args.allow_reconstructed_stage2_early_checkpoint_code
     ):
         ap.error(
             "branch resume options "
@@ -871,6 +880,11 @@ def main():
             allow_stage2b_historical_checkpoint=(
                 args.allow_stage2b_historical_checkpoint_code
             ),
+            allow_reconstructed_stage2_early_checkpoint=(
+                args.allow_reconstructed_stage2_early_checkpoint_code
+            ),
+            checkpoint_sha256=resume_metadata["sha256"],
+            starting_state_hash=resume_metadata["starting_state_hash"],
         )
         environment_keys = (
             "python", "platform", "torch", "numpy", "cuda_runtime", "cudnn",

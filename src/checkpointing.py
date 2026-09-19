@@ -28,6 +28,22 @@ STAGE2B_HISTORICAL_CODE_HASHES = {
     "src/strategies/replay.py": "55f9505680677d98b3adc836b2624de106fdb19b72fed515534350bc8c418f61",
     "src/instrumentation/subspace.py": "828ce024ccb5d7b459807ccd33e27373eeb61d1504354b188426ac0df01717ce",
 }
+RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT = (
+    "8b823b45d40fcdd830cd5b0a6879c524d166be08"
+)
+RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES = {
+    "src/run_llm_fcl_controller.py": "0a3cb8949909efc5740d58bf3efd5f7ed6eb10013547a2f260d197808ba530dd",
+    "src/checkpointing.py": "059c881e6b67c671cf5524f78ee1992a1bda12524bc89104c75dc77a1044190b",
+    "src/fl.py": "a88bd5d39ab43a67f2403a99a72b2dda12522923037d3b1aa0d7902d13006378",
+    "src/strategies/replay.py": "55f9505680677d98b3adc836b2624de106fdb19b72fed515534350bc8c418f61",
+    "src/instrumentation/subspace.py": "84bd513afcd826a0928d24d5d727c3a51f1029e52409a4e3e61d75b57cb80ad7",
+}
+RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_SHA256 = (
+    "a003cca896a857d592b26f8813b3228cbeb7bdab02139890298c0b2161944f7d"
+)
+RECONSTRUCTED_STAGE2_EARLY_STARTING_STATE_HASH = (
+    "51f7330f8d4782a13b6e3cc7fd8ded7241d009a7f0556b5aabab99442f721a99"
+)
 
 
 def sha256_file(path: os.PathLike[str] | str) -> str:
@@ -278,8 +294,11 @@ def validate_checkpoint_code_compatibility(
     current_manifest: Mapping[str, Any],
     *,
     allow_stage2b_historical_checkpoint: bool = False,
+    allow_reconstructed_stage2_early_checkpoint: bool = False,
+    checkpoint_sha256: str | None = None,
+    starting_state_hash: str | None = None,
 ) -> Dict[str, Any]:
-    """Validate code hashes, with one explicit exception for the Stage 2B parent."""
+    """Validate code hashes, with narrowly scoped audited exceptions only."""
     checkpoint_code = checkpoint_manifest.get("code", {})
     current_code = current_manifest.get("code", {})
     checkpoint_hashes = dict(checkpoint_code.get("files_sha256", {}))
@@ -290,6 +309,7 @@ def validate_checkpoint_code_compatibility(
 
     compatibility = {
         "exception_used": False,
+        "exception_name": None,
         "checkpoint_git_commit": checkpoint_commit,
         "current_git_commit": current_commit,
         "checkpoint_files_sha256": checkpoint_hashes,
@@ -297,20 +317,52 @@ def validate_checkpoint_code_compatibility(
     }
     if hashes_match:
         return compatibility
-    if not allow_stage2b_historical_checkpoint:
+    if allow_stage2b_historical_checkpoint and (
+        checkpoint_commit == STAGE2B_HISTORICAL_CHECKPOINT_COMMIT
+    ):
+        if checkpoint_hashes != STAGE2B_HISTORICAL_CODE_HASHES:
+            raise RuntimeError(
+                "Stage 2B historical-code exception rejected checkpoint source hashes"
+            )
+        compatibility["exception_used"] = True
+        compatibility["exception_name"] = "stage2b_historical_checkpoint_code"
+        return compatibility
+    if allow_reconstructed_stage2_early_checkpoint and (
+        checkpoint_commit == RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT
+    ):
+        if checkpoint_hashes != RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES:
+            raise RuntimeError(
+                "reconstructed Stage 2 early-checkpoint exception rejected "
+                "checkpoint source hashes"
+            )
+        if checkpoint_sha256 != RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_SHA256:
+            raise RuntimeError(
+                "reconstructed Stage 2 early-checkpoint exception rejected "
+                "checkpoint SHA256"
+            )
+        if starting_state_hash != RECONSTRUCTED_STAGE2_EARLY_STARTING_STATE_HASH:
+            raise RuntimeError(
+                "reconstructed Stage 2 early-checkpoint exception rejected "
+                "starting-state hash"
+            )
+        compatibility["exception_used"] = True
+        compatibility["exception_name"] = (
+            "reconstructed_stage2_early_checkpoint_code"
+        )
+        return compatibility
+    if not allow_stage2b_historical_checkpoint and not allow_reconstructed_stage2_early_checkpoint:
         raise RuntimeError("checkpoint code-file checksums differ from current code")
-    if checkpoint_commit != STAGE2B_HISTORICAL_CHECKPOINT_COMMIT:
+    if allow_stage2b_historical_checkpoint:
         raise RuntimeError(
             "Stage 2B historical-code exception rejected checkpoint commit: "
             f"expected {STAGE2B_HISTORICAL_CHECKPOINT_COMMIT!r}, "
             f"found {checkpoint_commit!r}"
         )
-    if checkpoint_hashes != STAGE2B_HISTORICAL_CODE_HASHES:
-        raise RuntimeError(
-            "Stage 2B historical-code exception rejected checkpoint source hashes"
-        )
-    compatibility["exception_used"] = True
-    return compatibility
+    raise RuntimeError(
+        "reconstructed Stage 2 early-checkpoint exception rejected checkpoint "
+        f"commit: expected {RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT!r}, "
+        f"found {checkpoint_commit!r}"
+    )
 
 
 def requires_endpoint_equality(update_control: str, projection_lambda: float) -> bool:
