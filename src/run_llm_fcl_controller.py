@@ -467,7 +467,8 @@ def main():
         action="store_true",
         help=(
             "allow only the audited reconstructed Stage 2 early checkpoint "
-            "(commit, source hashes, SHA256, and starting-state hash are all checked)"
+            "(source hashes, SHA256, starting-state hash, parent run, and next round "
+            "are all checked)"
         ),
     )
     ap.add_argument(
@@ -885,6 +886,8 @@ def main():
             ),
             checkpoint_sha256=resume_metadata["sha256"],
             starting_state_hash=resume_metadata["starting_state_hash"],
+            parent_run_id=resume_payload["parent_run_id"],
+            next_round=resume_payload["next_round"],
         )
         environment_keys = (
             "python", "platform", "torch", "numpy", "cuda_runtime", "cudnn",

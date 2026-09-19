@@ -28,9 +28,6 @@ STAGE2B_HISTORICAL_CODE_HASHES = {
     "src/strategies/replay.py": "55f9505680677d98b3adc836b2624de106fdb19b72fed515534350bc8c418f61",
     "src/instrumentation/subspace.py": "828ce024ccb5d7b459807ccd33e27373eeb61d1504354b188426ac0df01717ce",
 }
-RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT = (
-    "8b823b45d40fcdd830cd5b0a6879c524d166be08"
-)
 RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES = {
     "src/run_llm_fcl_controller.py": "0a3cb8949909efc5740d58bf3efd5f7ed6eb10013547a2f260d197808ba530dd",
     "src/checkpointing.py": "059c881e6b67c671cf5524f78ee1992a1bda12524bc89104c75dc77a1044190b",
@@ -38,12 +35,14 @@ RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES = {
     "src/strategies/replay.py": "55f9505680677d98b3adc836b2624de106fdb19b72fed515534350bc8c418f61",
     "src/instrumentation/subspace.py": "84bd513afcd826a0928d24d5d727c3a51f1029e52409a4e3e61d75b57cb80ad7",
 }
-RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_SHA256 = (
-    "a003cca896a857d592b26f8813b3228cbeb7bdab02139890298c0b2161944f7d"
-)
 RECONSTRUCTED_STAGE2_EARLY_STARTING_STATE_HASH = (
-    "51f7330f8d4782a13b6e3cc7fd8ded7241d009a7f0556b5aabab99442f721a99"
+    "fb3611e31e499090a5f7f2064a8162ad92d0af6708431d63ce924c75096bb0c5"
 )
+RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_SHA256 = (
+    "29df9bf811dadd2f66f281abd3a1a340052d9f11c1d5263c00eb8866dc483b25"
+)
+RECONSTRUCTED_STAGE2_EARLY_PARENT_RUN_ID = "20260916-120737"
+RECONSTRUCTED_STAGE2_EARLY_NEXT_ROUND = 1
 
 
 def sha256_file(path: os.PathLike[str] | str) -> str:
@@ -297,6 +296,8 @@ def validate_checkpoint_code_compatibility(
     allow_reconstructed_stage2_early_checkpoint: bool = False,
     checkpoint_sha256: str | None = None,
     starting_state_hash: str | None = None,
+    parent_run_id: str | None = None,
+    next_round: int | None = None,
 ) -> Dict[str, Any]:
     """Validate code hashes, with narrowly scoped audited exceptions only."""
     checkpoint_code = checkpoint_manifest.get("code", {})
@@ -327,9 +328,12 @@ def validate_checkpoint_code_compatibility(
         compatibility["exception_used"] = True
         compatibility["exception_name"] = "stage2b_historical_checkpoint_code"
         return compatibility
-    if allow_reconstructed_stage2_early_checkpoint and (
-        checkpoint_commit == RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT
-    ):
+    if allow_reconstructed_stage2_early_checkpoint:
+        if checkpoint_commit is not None:
+            raise RuntimeError(
+                "reconstructed Stage 2 early-checkpoint exception rejected "
+                "checkpoint manifest git commit"
+            )
         if checkpoint_hashes != RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES:
             raise RuntimeError(
                 "reconstructed Stage 2 early-checkpoint exception rejected "
@@ -345,6 +349,16 @@ def validate_checkpoint_code_compatibility(
                 "reconstructed Stage 2 early-checkpoint exception rejected "
                 "starting-state hash"
             )
+        if parent_run_id != RECONSTRUCTED_STAGE2_EARLY_PARENT_RUN_ID:
+            raise RuntimeError(
+                "reconstructed Stage 2 early-checkpoint exception rejected "
+                "parent run ID"
+            )
+        if next_round != RECONSTRUCTED_STAGE2_EARLY_NEXT_ROUND:
+            raise RuntimeError(
+                "reconstructed Stage 2 early-checkpoint exception rejected "
+                "next round"
+            )
         compatibility["exception_used"] = True
         compatibility["exception_name"] = (
             "reconstructed_stage2_early_checkpoint_code"
@@ -358,11 +372,7 @@ def validate_checkpoint_code_compatibility(
             f"expected {STAGE2B_HISTORICAL_CHECKPOINT_COMMIT!r}, "
             f"found {checkpoint_commit!r}"
         )
-    raise RuntimeError(
-        "reconstructed Stage 2 early-checkpoint exception rejected checkpoint "
-        f"commit: expected {RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT!r}, "
-        f"found {checkpoint_commit!r}"
-    )
+    raise RuntimeError("checkpoint code-file checksums differ from current code")
 
 
 def requires_endpoint_equality(update_control: str, projection_lambda: float) -> bool:

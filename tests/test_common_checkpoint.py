@@ -13,8 +13,9 @@ from torch.utils.data import DataLoader, Dataset
 from src.checkpointing import (
     CHECKPOINT_FORMAT_VERSION,
     RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES,
-    RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT,
     RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_SHA256,
+    RECONSTRUCTED_STAGE2_EARLY_NEXT_ROUND,
+    RECONSTRUCTED_STAGE2_EARLY_PARENT_RUN_ID,
     RECONSTRUCTED_STAGE2_EARLY_STARTING_STATE_HASH,
     STAGE2B_HISTORICAL_CHECKPOINT_COMMIT,
     STAGE2B_HISTORICAL_CODE_HASHES,
@@ -515,7 +516,7 @@ class CommonCheckpointChecks(unittest.TestCase):
     def test_reconstructed_early_checkpoint_exception_requires_full_provenance(self):
         checkpoint_manifest = {
             "code": {
-                "git_commit": RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT,
+                "git_commit": None,
                 "files_sha256": dict(RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES),
             }
         }
@@ -528,6 +529,8 @@ class CommonCheckpointChecks(unittest.TestCase):
             allow_reconstructed_stage2_early_checkpoint=True,
             checkpoint_sha256=RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_SHA256,
             starting_state_hash=RECONSTRUCTED_STAGE2_EARLY_STARTING_STATE_HASH,
+            parent_run_id=RECONSTRUCTED_STAGE2_EARLY_PARENT_RUN_ID,
+            next_round=RECONSTRUCTED_STAGE2_EARLY_NEXT_ROUND,
         )
         self.assertTrue(compatibility["exception_used"])
         self.assertEqual(
@@ -545,7 +548,7 @@ class CommonCheckpointChecks(unittest.TestCase):
         }
         exact_manifest = {
             "code": {
-                "git_commit": RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_COMMIT,
+                "git_commit": None,
                 "files_sha256": dict(RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_CODE_HASHES),
             }
         }
@@ -553,10 +556,12 @@ class CommonCheckpointChecks(unittest.TestCase):
             "allow_reconstructed_stage2_early_checkpoint": True,
             "checkpoint_sha256": RECONSTRUCTED_STAGE2_EARLY_CHECKPOINT_SHA256,
             "starting_state_hash": RECONSTRUCTED_STAGE2_EARLY_STARTING_STATE_HASH,
+            "parent_run_id": RECONSTRUCTED_STAGE2_EARLY_PARENT_RUN_ID,
+            "next_round": RECONSTRUCTED_STAGE2_EARLY_NEXT_ROUND,
         }
-        with self.assertRaisesRegex(RuntimeError, "rejected checkpoint commit"):
+        with self.assertRaisesRegex(RuntimeError, "rejected checkpoint manifest git commit"):
             validate_checkpoint_code_compatibility(
-                {"code": {**exact_manifest["code"], "git_commit": "wrong"}},
+                {"code": {**exact_manifest["code"], "git_commit": "8b823b"}},
                 current_manifest,
                 **common,
             )
@@ -585,6 +590,18 @@ class CommonCheckpointChecks(unittest.TestCase):
                 exact_manifest,
                 current_manifest,
                 **{**common, "starting_state_hash": "another-state"},
+            )
+        with self.assertRaisesRegex(RuntimeError, "rejected parent run ID"):
+            validate_checkpoint_code_compatibility(
+                exact_manifest,
+                current_manifest,
+                **{**common, "parent_run_id": "another-parent"},
+            )
+        with self.assertRaisesRegex(RuntimeError, "rejected next round"):
+            validate_checkpoint_code_compatibility(
+                exact_manifest,
+                current_manifest,
+                **{**common, "next_round": 5},
             )
 
     def test_projection_and_shrinkage_load_same_start_state_hash(self):
