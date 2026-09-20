@@ -25,6 +25,12 @@ from src.instrumentation.subspace import (
     aggregate_update_energy_records,
 )
 from src.instrumentation.shrinkage import load_shrinkage_schedule
+from src.data_il_streams import (
+    CONTROLLED_DOMAIN_TRANSFORMS,
+    StageDomainDataset,
+    make_controlled_domain_shift_batches,
+    stage_class_counts,
+)
 from src.checkpointing import (
     CHECKPOINT_FORMAT_VERSION,
     branch_control_metadata,
@@ -423,6 +429,12 @@ def main():
     ap.add_argument("--split_mode", choices=["equal", "dirichlet"], default="equal")
     ap.add_argument("--val_size", type=int, default=5000)
     ap.add_argument("--cl_batches", type=int, default=7)
+    ap.add_argument(
+        "--stream_mode",
+        choices=["random_chunks", "controlled_domain_shift"],
+        default="random_chunks",
+        help="continual Data-IL stream; random_chunks preserves the existing protocol",
+    )
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--optimizer", choices=["adam","sgd"], default="adam")
     ap.add_argument("--early_patience", type=int, default=5)
@@ -688,9 +700,16 @@ def main():
         transforms.Normalize((0.485,0.456,0.406),(0.229,0.224,0.225)),
     ])
 
-    # Data
-    trainset_full = datasets.CIFAR100(root="./data", train=True,  download=True, transform=tf_train)
-    testset       = datasets.CIFAR100(root="./data", train=False, download=True, transform=tf_test)
+    # Keep the existing dataset construction byte-for-byte in the default
+    # stream. Controlled mode owns transforms in its stage dataset wrapper.
+    if args.stream_mode == "random_chunks":
+        trainset_full = datasets.CIFAR100(root="./data", train=True,  download=True, transform=tf_train)
+        testset       = datasets.CIFAR100(root="./data", train=False, download=True, transform=tf_test)
+    else:
+        if args.cl_batches != len(CONTROLLED_DOMAIN_TRANSFORMS):
+            ap.error("controlled_domain_shift requires --cl_batches 7")
+        trainset_full = datasets.CIFAR100(root="./data", train=True, download=True, transform=None)
+        testset = datasets.CIFAR100(root="./data", train=False, download=True, transform=None)
 
     total_train = len(trainset_full)  # 50_000
     val_size = args.val_size          # 5_000
@@ -702,11 +721,34 @@ def main():
     train_indices = np.array(train_subset.indices, dtype=np.int64)
     val_indices   = np.array(val_subset.indices, dtype=np.int64)
 
-    valset = Subset(trainset_full, val_indices)
+    valset = (
+        Subset(trainset_full, val_indices)
+        if args.stream_mode == "random_chunks"
+        else StageDomainDataset(trainset_full, val_indices, stage=0, experiment_seed=args.seed)
+    )
     val_loader = DataLoader(valset, batch_size=256, shuffle=False,
                             num_workers=args.num_workers, pin_memory=True)
-    test_loader = DataLoader(testset, batch_size=256, shuffle=False,
+    clean_testset = (
+        testset
+        if args.stream_mode == "random_chunks"
+        else StageDomainDataset(testset, range(len(testset)), stage=0, experiment_seed=args.seed)
+    )
+    test_loader = DataLoader(clean_testset, batch_size=256, shuffle=False,
                              num_workers=args.num_workers, pin_memory=True)
+    domain_test_loaders = (
+        None
+        if args.stream_mode == "random_chunks"
+        else [
+            DataLoader(
+                StageDomainDataset(testset, range(len(testset)), stage=stage, experiment_seed=args.seed),
+                batch_size=256,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=True,
+            )
+            for stage in range(len(CONTROLLED_DOMAIN_TRANSFORMS))
+        ]
+    )
 
     print(f"[Split] train={len(train_indices)} val={len(val_indices)} test={len(testset)}", flush=True)
 
@@ -751,7 +793,7 @@ def main():
     for i, idxs in enumerate(splits):
         print(f"[Split] client {i}: {len(idxs)} images", flush=True)
 
-    # Build CL schedule: initial ~0.466 + even splits
+    # Build CL schedule: initial ~0.466 + even splits.
     def make_cl_batches(indices, num_batches=7, seed=42):
         rng_local = np.random.RandomState(seed)
         idx = np.array(indices, dtype=np.int64)
@@ -768,13 +810,37 @@ def main():
         return [first.tolist()] + [c.tolist() for c in chunks]
 
     cl_schedule, cl_rows = [], []
+    controlled_stream_metadata = None
+    targets = np.asarray(trainset_full.targets)
     for cid, idxs in enumerate(splits):
-        batches = make_cl_batches(idxs, num_batches=args.cl_batches, seed=args.seed + cid)
+        batches = (
+            make_cl_batches(idxs, num_batches=args.cl_batches, seed=args.seed + cid)
+            if args.stream_mode == "random_chunks"
+            else make_controlled_domain_shift_batches(
+                idxs, targets, num_batches=args.cl_batches, seed=args.seed + cid
+            )
+        )
         cl_schedule.append(batches)
         sizes = [len(b) for b in batches]
         print(f"[CL] client {cid}: {sizes} (sum={sum(sizes)})", flush=True)
         for i, b in enumerate(batches, start=1):
-            cl_rows.append({"run_id": "", "client": cid, "cl_batch": i, "size": len(b)})
+            row = {"run_id": "", "client": cid, "cl_batch": i, "size": len(b)}
+            if args.stream_mode == "controlled_domain_shift":
+                row["stream_mode"] = args.stream_mode
+                row["stage_transform"] = CONTROLLED_DOMAIN_TRANSFORMS[i - 1]["name"]
+            cl_rows.append(row)
+
+    if args.stream_mode == "controlled_domain_shift":
+        controlled_stream_metadata = {
+            "stream_mode": args.stream_mode,
+            "seed": int(args.seed),
+            "stage_transforms": list(CONTROLLED_DOMAIN_TRANSFORMS),
+            "stage_sizes_by_client": [[len(batch) for batch in batches] for batches in cl_schedule],
+            "per_stage_class_counts_by_client": [
+                stage_class_counts(batches, targets) for batches in cl_schedule
+            ],
+            "domain_evaluation_history": [],
+        }
 
     data_state = {
         "train_indices": train_indices.tolist(),
@@ -785,6 +851,11 @@ def main():
             for client_batches in cl_schedule
         ],
     }
+    if controlled_stream_metadata is not None:
+        data_state["controlled_domain_shift"] = {
+            "seed": int(args.seed),
+            "stage_transforms": list(CONTROLLED_DOMAIN_TRANSFORMS),
+        }
     if resume_payload is not None:
         checkpoint_manifest = resume_payload.get("manifest", {})
         validate_resume_protocol(checkpoint_manifest.get("protocol", {}), protocol)
@@ -794,7 +865,11 @@ def main():
     # Init clients
     clients = []
     for cid, idx in enumerate(splits):
-        subset = Subset(trainset_full, idx)
+        subset = (
+            Subset(trainset_full, idx)
+            if args.stream_mode == "random_chunks"
+            else StageDomainDataset(trainset_full, idx, stage=0, experiment_seed=args.seed, training=True)
+        )
         loader = DataLoader(
             subset,
             batch_size=args.batch_size,
@@ -923,6 +998,7 @@ def main():
     print("[DEBUG] After initial evaluate()", flush=True)
 
     best_recall = per_class.copy()
+    best_domain_accuracy = [float(acc)] + [0.0] * (len(CONTROLLED_DOMAIN_TRANSFORMS) - 1)
     forgetting = np.zeros_like(per_class)
     global_loss = evaluate_loss(global_model, device, test_loader)
     ema_loss = global_loss
@@ -1403,8 +1479,19 @@ def main():
                 batch_indices = batches[-1]
                 batch_id = len(batches) - 1
 
+            stage_dataset = (
+                Subset(trainset_full, batch_indices)
+                if args.stream_mode == "random_chunks"
+                else StageDomainDataset(
+                    trainset_full,
+                    batch_indices,
+                    stage=min(r, args.cl_batches - 1),
+                    experiment_seed=args.seed,
+                    training=True,
+                )
+            )
             c.loader = DataLoader(
-                Subset(trainset_full, batch_indices),
+                stage_dataset,
                 batch_size=args.batch_size,
                 shuffle=True,
                 num_workers=args.num_workers,
@@ -1509,6 +1596,35 @@ def main():
         else:
             rollback_flag = False
 
+        domain_metrics = None
+        if domain_test_loaders is not None:
+            current_domain = min(r, len(domain_test_loaders) - 1)
+            domain_accuracies = {}
+            previous_retention = []
+            for domain in range(current_domain + 1):
+                domain_acc = float(acc) if domain == 0 else float(
+                    evaluate(global_model, device, domain_test_loaders[domain])[0]
+                )
+                domain_accuracies[str(domain)] = domain_acc
+                if domain < current_domain and best_domain_accuracy[domain] > 0.0:
+                    previous_retention.append(domain_acc / best_domain_accuracy[domain])
+                best_domain_accuracy[domain] = max(best_domain_accuracy[domain], domain_acc)
+            previous_values = [domain_accuracies[str(domain)] for domain in range(current_domain)]
+            domain_metrics = {
+                "current_domain": current_domain,
+                "current_domain_accuracy": domain_accuracies[str(current_domain)],
+                "seen_domain_accuracies": domain_accuracies,
+                "mean_previous_domain_accuracy": (
+                    float(np.mean(previous_values)) if previous_values else float("nan")
+                ),
+                "mean_previous_domain_retention": (
+                    float(np.mean(previous_retention)) if previous_retention else float("nan")
+                ),
+            }
+            controlled_stream_metadata["domain_evaluation_history"].append(
+                {"round": int(r), **domain_metrics}
+            )
+
         # ---- Update best state ----
         if acc > best_global_acc:
             best_global_acc = float(acc)
@@ -1533,7 +1649,7 @@ def main():
         print(f"[round {r}] AULC={aulc_running:.4f} | ACC={acc:.4f} | COMM_round={bytes_last_round:,} | COMM_cum={bytes_cum:,}")
 
         # ---- Round summary log ----
-        round_logs.append({
+        round_log = {
             "run_id": run_id, "tag": args.tag, "round": r,
             "global_acc": float(acc),
 
@@ -1586,7 +1702,20 @@ def main():
                 "measurement_overhead_seconds", 0.0
             ),
             "gradient_measurement_count": subspace_metrics.get("gradient_measurement_count", 0),
-        })
+        }
+        if domain_metrics is not None:
+            round_log.update({
+                "stream_mode": args.stream_mode,
+                "current_domain": domain_metrics["current_domain"],
+                "current_stage_transform": CONTROLLED_DOMAIN_TRANSFORMS[
+                    domain_metrics["current_domain"]
+                ]["name"],
+                "current_domain_accuracy": domain_metrics["current_domain_accuracy"],
+                "seen_domain_accuracies": json.dumps(domain_metrics["seen_domain_accuracies"], sort_keys=True),
+                "mean_previous_domain_accuracy": domain_metrics["mean_previous_domain_accuracy"],
+                "mean_previous_domain_retention": domain_metrics["mean_previous_domain_retention"],
+            })
+        round_logs.append(round_log)
         
         print(f"[Round {r}] acc={acc:.3f} (best={best_global_acc:.3f})", flush=True)
 
@@ -1778,6 +1907,13 @@ def main():
           results_path, summary_path, cl_path, flush=True)
     if update_energy_rows:
         print("✓ Wrote update-energy CSVs:", step_energy_path, round_energy_path, flush=True)
+    if controlled_stream_metadata is not None:
+        metadata_path = output_dir / "controlled_domain_shift_metadata.json"
+        metadata_path.write_text(
+            json.dumps(controlled_stream_metadata, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        print("✓ Wrote controlled-stream metadata:", metadata_path, flush=True)
     if subspace_instrumentation is not None:
         subspace_instrumentation.close()
 
