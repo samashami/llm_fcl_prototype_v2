@@ -1,6 +1,6 @@
 # src/run_llm_fcl_controller.py
 
-import argparse, time, copy, random
+import argparse, time, copy, hashlib, random
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
@@ -16,6 +16,14 @@ from src.strategies.replay import ReplayBuffer
 from src.policy import Policy
 from src.policy.lmss_api import lmss_decide_action_api
 from src.policy.lmss_openrouter import lmss_decide_action_openrouter
+from src.policy.qcdg import (
+    QueueState,
+    env_flag_true,
+    env_float,
+    queue_fields_for_state,
+    should_invoke_lmss,
+    update_queue,
+)
 from src.agent_io import save_json
 from src.agent_io import write_state_json, write_action_json, validate_action
 from src.mock_agent import decide_action as mock_decide_action
@@ -132,6 +140,9 @@ def _compact_state_for_sft(state):
         "forget_mean": float(round(g["forget_mean"], 4)),
         "divergence": float(round(g["divergence"], 4)),
     }
+    for key in ("Q", "P", "delta_q", "Q_norm", "P_norm", "delta_q_norm"):
+        if key in g:
+            keep[key] = float(round(float(g[key]), 4))
     clients = []
     for c in state["clients"]:
         vloss = c["vloss"]
@@ -429,6 +440,11 @@ def main():
     ap.add_argument("--tag", type=str, default="controller_v4")
     ap.add_argument("--controller", choices=["v4", "mock", "fixed", "sft", "lmss_api", "lmss_local", "lmss_openrouter"], default="v4")
     ap.add_argument("--lmss_model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
+    ap.add_argument("--use_queue_features", "--use-queue-features", action="store_true", help="append QCDG queue features to LMSS state")
+    ap.add_argument("--use_drift_gate", "--use-drift-gate", action="store_true", help="invoke LMSS only on QCDG drift triggers")
+    ap.add_argument("--qcdg_tau_q", "--qcdg-tau-q", type=float, default=None, help="QCDG delta-Q threshold")
+    ap.add_argument("--qcdg_tau_d", "--qcdg-tau-d", type=float, default=None, help="QCDG divergence threshold")
+    ap.add_argument("--qcdg_tau_a", "--qcdg-tau-a", type=float, default=None, help="QCDG absolute accuracy-change threshold")
     ap.add_argument("--measure_subspaces", action="store_true",
                     help="enable read-only protected-subspace measurements")
     ap.add_argument("--subspace_energy", type=float, default=0.95)
@@ -505,6 +521,14 @@ def main():
     )
     ap.add_argument("--output_dir", type=str, default=".")
     args = ap.parse_args()
+    args.use_queue_features = bool(args.use_queue_features) or env_flag_true("USE_QUEUE_FEATURES")
+    args.use_drift_gate = bool(args.use_drift_gate) or env_flag_true("USE_DRIFT_GATE")
+    args.qcdg_tau_q = float(args.qcdg_tau_q) if args.qcdg_tau_q is not None else env_float("QCDG_TAU_Q", 0.02)
+    args.qcdg_tau_d = float(args.qcdg_tau_d) if args.qcdg_tau_d is not None else env_float("QCDG_TAU_D", 0.05)
+    args.qcdg_tau_a = float(args.qcdg_tau_a) if args.qcdg_tau_a is not None else env_float("QCDG_TAU_A", 0.01)
+    qcdg_enabled = args.use_queue_features or args.use_drift_gate
+    if qcdg_enabled and args.controller not in {"lmss_api", "lmss_local", "lmss_openrouter"}:
+        ap.error("QCDG flags require an LMSS controller")
 
     if args.capture_common_checkpoints:
         if args.controller != "fixed" or args.optimizer != "adam":
@@ -990,6 +1014,34 @@ def main():
     # --- metrics accumulators ---
     acc_hist = []            # for AULC
     comm_bytes_cum = 0       # cumulative comm
+    qcdg_queue = QueueState()
+    qcdg_last_action = None
+    qcdg_last_hp = None
+    qcdg_last_invoked_round = None
+    qcdg_trigger = False
+    qcdg_lmss_called = False
+    qcdg_strategy = ""
+
+    @torch.no_grad()
+    def _qcdg_replay_loss(client, round_id, max_samples=64):
+        """Read replay CE without consuming the global Python replay RNG stream."""
+        replay = getattr(client, "replay", None)
+        if replay is None or not replay.data:
+            return None
+        count = min(int(max_samples), len(replay.data))
+        seed_bytes = hashlib.sha256(
+            f"qcdg-replay-loss:{args.seed}:{round_id}:{client.cid}".encode("utf-8")
+        ).digest()
+        sampler = random.Random(int.from_bytes(seed_bytes[:8], "big"))
+        samples = sampler.sample(list(replay.data), count)
+        x = torch.stack([item[0] for item in samples]).to(client.device)
+        y = torch.stack([item[1] for item in samples]).to(client.device)
+        was_training = client.model.training
+        client.model.eval()
+        loss = float(client.criterion(client.model(x), y).item())
+        if was_training:
+            client.model.train()
+        return loss
 
     parent_run_id = run_id
     start_round = 0
@@ -1196,6 +1248,8 @@ def main():
             },
             "clients": client_snaps,
         }
+        if args.use_queue_features:
+            state["global"].update(queue_fields_for_state(qcdg_queue))
         write_state_json(io_root, r, state)
 
         # =========================================================
@@ -1217,6 +1271,64 @@ def main():
             hp_lr = float(args.lr)
             rep = float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50
             hp_notes = "Mock"
+
+        elif qcdg_enabled and args.controller in {"lmss_api", "lmss_local", "lmss_openrouter"}:
+            qcdg_trigger = (
+                should_invoke_lmss(
+                    delta_q=qcdg_queue.delta_q,
+                    divergence=div_norm,
+                    delta_acc=acc_delta,
+                    round_id=r,
+                    tau_q=args.qcdg_tau_q,
+                    tau_d=args.qcdg_tau_d,
+                    tau_a=args.qcdg_tau_a,
+                    last_invoked_round=qcdg_last_invoked_round,
+                )
+                if args.use_drift_gate
+                else True
+            )
+            reuse_previous = (
+                args.use_drift_gate and not qcdg_trigger and qcdg_last_action is not None
+            )
+            if reuse_previous:
+                action = copy.deepcopy(qcdg_last_action)
+                hp_lr = float(qcdg_last_hp["lr"])
+                rep = float(action["client_params"][0]["replay_ratio"])
+                hp_notes = f"{qcdg_last_hp['notes']}_QCDG_REUSE"
+                qcdg_lmss_called = False
+                qcdg_strategy = str(action.get("policy_source", "LMSS"))
+            else:
+                if args.controller == "lmss_api":
+                    raw = lmss_decide_action_api(
+                        state, compact_state_fn=_compact_state_for_sft, model="gpt-4o-mini"
+                    )
+                    default_source = "LMSS_API"
+                elif args.controller == "lmss_local":
+                    from src.policy.lmss_local import lmss_decide_action_local
+                    raw = lmss_decide_action_local(
+                        state,
+                        compact_state_fn=_compact_state_for_sft,
+                        model_name=getattr(args, "lmss_model", "Qwen/Qwen2.5-0.5B-Instruct"),
+                    )
+                    default_source = "LMSS_LOCAL"
+                else:
+                    raw = lmss_decide_action_openrouter(
+                        state,
+                        compact_state_fn=_compact_state_for_sft,
+                        model=getattr(args, "lmss_model", "openai/gpt-4o-mini"),
+                    )
+                    default_source = "LMSS_OPENROUTER"
+                action = validate_action(
+                    raw, n_clients=len(clients), policy_source=raw.get("policy_source", default_source)
+                )
+                hp_lr = float(raw.get("lr", args.lr))
+                rep = float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50
+                hp_notes = raw.get("policy_source", default_source)
+                qcdg_lmss_called = True
+                qcdg_strategy = str(hp_notes)
+                qcdg_last_action = copy.deepcopy(action)
+                qcdg_last_hp = {"lr": hp_lr, "notes": hp_notes}
+                qcdg_last_invoked_round = r
 
         elif args.controller == "lmss_api":
             # LMSS via API: LLM selects strategy_id, we expand deterministically
@@ -1468,6 +1580,26 @@ def main():
                 flush=True,
             )
 
+        if qcdg_enabled:
+            per_client_new_loss = {}
+            for row in run_logs:
+                if row["round"] == r:
+                    per_client_new_loss[int(row["client"])] = float(row["train_loss"])
+            if len(per_client_new_loss) != len(clients):
+                raise RuntimeError("QCDG could not obtain one completed loss for every client")
+            l_new_values = []
+            l_buffer_values = []
+            for client in clients:
+                l_new = per_client_new_loss[int(client.cid)]
+                l_buffer = _qcdg_replay_loss(client, r)
+                l_new_values.append(l_new)
+                l_buffer_values.append(l_new if l_buffer is None else l_buffer)
+            qcdg_queue = update_queue(
+                qcdg_queue,
+                l_new=float(np.mean(l_new_values)),
+                l_buffer=float(np.mean(l_buffer_values)),
+            )
+
         # ---- Divergence (before FedAvg) ----
         with torch.no_grad():
             def flat_params(m: torch.nn.Module):
@@ -1533,7 +1665,7 @@ def main():
         print(f"[round {r}] AULC={aulc_running:.4f} | ACC={acc:.4f} | COMM_round={bytes_last_round:,} | COMM_cum={bytes_cum:,}")
 
         # ---- Round summary log ----
-        round_logs.append({
+        round_row = {
             "run_id": run_id, "tag": args.tag, "round": r,
             "global_acc": float(acc),
 
@@ -1586,7 +1718,17 @@ def main():
                 "measurement_overhead_seconds", 0.0
             ),
             "gradient_measurement_count": subspace_metrics.get("gradient_measurement_count", 0),
-        })
+        }
+        if qcdg_enabled:
+            round_row.update({
+                "Q": float(qcdg_queue.Q),
+                "P": float(qcdg_queue.P),
+                "delta_q": float(qcdg_queue.delta_q),
+                "qcdg_trigger": bool(qcdg_trigger),
+                "lmss_called": bool(qcdg_lmss_called),
+                "qcdg_strategy": qcdg_strategy,
+            })
+        round_logs.append(round_row)
         
         print(f"[Round {r}] acc={acc:.3f} (best={best_global_acc:.3f})", flush=True)
 
