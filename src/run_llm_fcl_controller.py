@@ -16,6 +16,8 @@ from src.strategies.replay import ReplayBuffer
 from src.policy import Policy
 from src.policy.lmss_api import lmss_decide_action_api
 from src.policy.lmss_openrouter import lmss_decide_action_openrouter
+from src.policy.adaptive_rho import build_action as build_adaptive_rho_action
+from src.policy.adaptive_rho import select_replay_ratio
 from src.agent_io import save_json
 from src.agent_io import write_state_json, write_action_json, validate_action
 from src.mock_agent import decide_action as mock_decide_action
@@ -427,7 +429,7 @@ def main():
     ap.add_argument("--optimizer", choices=["adam","sgd"], default="adam")
     ap.add_argument("--early_patience", type=int, default=5)
     ap.add_argument("--tag", type=str, default="controller_v4")
-    ap.add_argument("--controller", choices=["v4", "mock", "fixed", "sft", "lmss_api", "lmss_local", "lmss_openrouter"], default="v4")
+    ap.add_argument("--controller", choices=["v4", "mock", "fixed", "adaptive_rho", "sft", "lmss_api", "lmss_local", "lmss_openrouter"], default="v4")
     ap.add_argument("--lmss_model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     ap.add_argument("--measure_subspaces", action="store_true",
                     help="enable read-only protected-subspace measurements")
@@ -610,6 +612,7 @@ def main():
         "v4": "ControllerV4",
         "mock": "Mock",
         "fixed": "Fixed",
+        "adaptive_rho": "AdaptiveRho",
         "sft": "SFT_v0",
         "lmss_api": "LMSS_API",
         "lmss_local": "LMSS_LOCAL",
@@ -1338,6 +1341,23 @@ def main():
             action = validate_action(candidate, n_clients=len(clients), policy_source="ControllerV4")
             hp_lr = float(lr)
             hp_notes = " | ".join(notes)
+
+        elif args.controller == "adaptive_rho":
+            forgetting_used = float(np.mean(forgetting)) if forgetting is not None else float("nan")
+            decision = select_replay_ratio(
+                round_id=r,
+                previous_replay_ratio=float(last_hp["replay_ratio"]),
+                forgetting=forgetting_used,
+            )
+            candidate = build_adaptive_rho_action(
+                n_clients=len(clients), fixed_lr=args.lr, decision=decision
+            )
+            action = validate_action(
+                candidate, n_clients=len(clients), policy_source="AdaptiveRho"
+            )
+            hp_lr = float(args.lr)
+            rep = decision.replay_ratio
+            hp_notes = f"adaptive_rho:{decision.reason}"
             
         elif args.controller == "fixed":
             # fixed (paper CL defaults)
@@ -1533,7 +1553,7 @@ def main():
         print(f"[round {r}] AULC={aulc_running:.4f} | ACC={acc:.4f} | COMM_round={bytes_last_round:,} | COMM_cum={bytes_cum:,}")
 
         # ---- Round summary log ----
-        round_logs.append({
+        round_row = {
             "run_id": run_id, "tag": args.tag, "round": r,
             "global_acc": float(acc),
 
@@ -1586,7 +1606,18 @@ def main():
                 "measurement_overhead_seconds", 0.0
             ),
             "gradient_measurement_count": subspace_metrics.get("gradient_measurement_count", 0),
-        })
+        }
+        if args.controller == "adaptive_rho":
+            round_row.update({
+                "controller": controller_name,
+                "adaptive_rho_forgetting_used": float(decision.forgetting),
+                "adaptive_rho_previous_replay_ratio": float(decision.previous_replay_ratio),
+                "adaptive_rho_selected_replay_ratio": float(decision.replay_ratio),
+                "adaptive_rho_decision_reason": decision.reason,
+                "adaptive_rho_fixed_lr": float(args.lr),
+                "adaptive_rho_client_lr_scale": 1.0,
+            })
+        round_logs.append(round_row)
         
         print(f"[Round {r}] acc={acc:.3f} (best={best_global_acc:.3f})", flush=True)
 
