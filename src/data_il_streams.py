@@ -86,11 +86,15 @@ def make_controlled_domain_shift_batches(
     rng.shuffle(class_order)
     for class_id in class_order:
         queue = class_queues[class_id]
-        for stage in rng.permutation(num_batches)[: min(num_batches, len(queue))]:
+        stage_order = [
+            int(stage)
+            for stage in rng.permutation(num_batches)
+            if capacities[int(stage)] > 0
+        ]
+        spread_count = min(len(queue), len(stage_order))
+        for stage in stage_order[:spread_count]:
             batches[int(stage)].append(queue.pop())
             capacities[int(stage)] -= 1
-            if capacities[int(stage)] < 0:
-                raise RuntimeError("controlled stream initial class allocation overflowed a stage")
 
     # Fill residual capacities proportionally and deterministically. Relative
     # remaining capacity makes every class see the same target proportions,
