@@ -54,6 +54,20 @@ class ControlledDataILStreamTests(unittest.TestCase):
         self.assertEqual(sizes[0], round(0.466 * len(self.indices)))
         self.assertLessEqual(max(sizes[1:]) - min(sizes[1:]), 5)
 
+    def test_small_smoke_stream_respects_stage_capacities(self):
+        indices = list(range(140))
+        targets = [index % 100 for index in indices]
+        batches = make_controlled_domain_shift_batches(
+            indices, targets, num_batches=7, seed=41
+        )
+        self.assertEqual(
+            [len(batch) for batch in batches],
+            cl_batch_sizes(len(indices), 7),
+        )
+        flattened = [item for batch in batches for item in batch]
+        self.assertEqual(len(flattened), len(set(flattened)))
+        self.assertEqual(set(flattened), set(indices))
+
     def test_every_class_is_represented_when_each_class_has_seven_examples(self):
         batches = make_controlled_domain_shift_batches(self.indices, self.targets, seed=44)
         for batch in batches:
