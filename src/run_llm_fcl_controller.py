@@ -15,7 +15,7 @@ from src.fl import Client, Server
 from src.strategies.replay import ReplayBuffer
 from src.policy import Policy
 from src.policy.lmss_api import lmss_decide_action_api
-from src.policy.lmss_openrouter import lmss_decide_action_openrouter
+from src.policy.lmss_openrouter import STRATEGY_PALETTE, lmss_decide_action_openrouter
 from src.agent_io import save_json
 from src.agent_io import write_state_json, write_action_json, validate_action
 from src.mock_agent import decide_action as mock_decide_action
@@ -30,6 +30,17 @@ from src.data_il_streams import (
     StageDomainDataset,
     make_controlled_domain_shift_batches,
     stage_class_counts,
+)
+from src.attribution_protocol import (
+    CONTROL_MODES,
+    accumulate_post_initialization_utility,
+    block_epoch_budget,
+    load_frozen_action_schedule,
+    nearest_strategy_id,
+    resolve_domain_order,
+    restrict_action_axis,
+    stage_and_block,
+    validate_frozen_schedule_provenance,
 )
 from src.checkpointing import (
     CHECKPOINT_FORMAT_VERSION,
@@ -158,7 +169,16 @@ def _compact_state_for_sft(state):
             "new_batch_size": int(c["new_batch_size"]),
             "last_lr": _safe_float(c.get("last_lr")),
         })
-    return {"global": keep, "clients": clients}
+    compact = {
+        "round_id": int(state.get("round_id", 0)),
+        "stage_id": int(state.get("stage_id", state.get("round_id", 0))),
+        "block_id": int(state.get("block_id", 0)),
+        "global": keep,
+        "clients": clients,
+    }
+    if "accuracy_unit" in state:
+        compact["accuracy_unit"] = str(state["accuracy_unit"])
+    return compact
 
 import re
 
@@ -435,12 +455,50 @@ def main():
         default="random_chunks",
         help="continual Data-IL stream; random_chunks preserves the existing protocol",
     )
+    ap.add_argument(
+        "--attribution_protocol",
+        action="store_true",
+        help="enable the matched-budget feedback-attribution study protocol",
+    )
+    ap.add_argument(
+        "--attribution_smoke",
+        action="store_true",
+        help="allow only the documented reduced-compute attribution smoke test",
+    )
+    ap.add_argument("--blocks_per_stage", type=int, default=1)
+    ap.add_argument(
+        "--domain_order",
+        choices=["development", "heldout"],
+        default="development",
+    )
+    ap.add_argument(
+        "--evaluation_source",
+        choices=["test", "validation"],
+        default="test",
+        help="reported evaluation source; development attribution runs must use validation",
+    )
+    ap.add_argument(
+        "--control_mode",
+        choices=list(CONTROL_MODES),
+        default="joint",
+        help="restrict the selected action to joint, learning-rate-only, or replay-only control",
+    )
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--optimizer", choices=["adam","sgd"], default="adam")
     ap.add_argument("--early_patience", type=int, default=5)
     ap.add_argument("--tag", type=str, default="controller_v4")
-    ap.add_argument("--controller", choices=["v4", "mock", "fixed", "sft", "lmss_api", "lmss_local", "lmss_openrouter"], default="v4")
-    ap.add_argument("--lmss_model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
+    ap.add_argument(
+        "--controller",
+        choices=[
+            "v4", "rules_joint", "mock", "fixed", "frozen_lmss", "sft", "lmss_api",
+            "lmss_local", "lmss_openrouter",
+        ],
+        default="v4",
+    )
+    ap.add_argument("--lmss_model", type=str, default=None)
+    ap.add_argument("--frozen_action_schedule", type=str, default=None)
+    ap.add_argument("--save_attribution_stage0", type=str, default=None)
+    ap.add_argument("--resume_attribution_stage0", type=str, default=None)
     ap.add_argument("--measure_subspaces", action="store_true",
                     help="enable read-only protected-subspace measurements")
     ap.add_argument("--subspace_energy", type=float, default=0.95)
@@ -518,6 +576,103 @@ def main():
     ap.add_argument("--output_dir", type=str, default=".")
     args = ap.parse_args()
 
+    if args.attribution_protocol:
+        if args.stream_mode != "controlled_domain_shift":
+            ap.error("--attribution_protocol requires --stream_mode controlled_domain_shift")
+        if args.blocks_per_stage != 2:
+            ap.error("--attribution_protocol requires --blocks_per_stage 2")
+        expected_rounds = args.cl_batches * args.blocks_per_stage
+        if args.rounds != expected_rounds:
+            ap.error(
+                "--attribution_protocol requires "
+                f"--rounds {expected_rounds} for {args.cl_batches} stages"
+            )
+        if args.epochs < args.blocks_per_stage:
+            ap.error("--epochs must allow at least one epoch per control block")
+        allowed_controllers = {
+            "fixed", "frozen_lmss", "lmss_openrouter", "rules_joint"
+        }
+        if args.controller not in allowed_controllers:
+            ap.error(
+                "--attribution_protocol supports only fixed, frozen_lmss, "
+                "lmss_openrouter, and rules_joint"
+            )
+        if args.controller != "lmss_openrouter" and args.control_mode != "joint":
+            ap.error(
+                "eta_only and rho_only are defined only for live lmss_openrouter"
+            )
+        if (
+            args.update_control != "projection"
+            or args.projection_lambda != 0.0
+            or args.measure_subspaces
+            or args.shrinkage_schedule
+        ):
+            ap.error(
+                "attribution runs prohibit projection, shrinkage, and subspace instrumentation"
+            )
+        expected_full = {
+            "clients": 4,
+            "split_mode": "equal",
+            "optimizer": "adam",
+            "epochs": 5,
+            "batch_size": 256,
+            "lr": 1e-4,
+            "subset_per_client": -1,
+            "val_size": 5000,
+            "cl_batches": 7,
+        }
+        expected_smoke = {
+            **expected_full,
+            "epochs": 2,
+            "batch_size": 32,
+            "subset_per_client": 140,
+            "val_size": 700,
+        }
+        expected_config = expected_smoke if args.attribution_smoke else expected_full
+        config_mismatches = {
+            name: {"expected": expected, "found": getattr(args, name)}
+            for name, expected in expected_config.items()
+            if getattr(args, name) != expected
+        }
+        if config_mismatches:
+            ap.error(
+                "attribution configuration differs from the frozen protocol: "
+                f"{config_mismatches}"
+            )
+        if args.attribution_smoke and (
+            args.controller != "fixed"
+            or args.control_mode != "joint"
+            or args.domain_order != "development"
+            or args.evaluation_source != "validation"
+        ):
+            ap.error("--attribution_smoke is only the documented fixed development run")
+        if args.domain_order == "development" and args.evaluation_source != "validation":
+            ap.error(
+                "development attribution runs require --evaluation_source validation"
+            )
+        if args.domain_order == "heldout" and args.evaluation_source != "test":
+            ap.error("held-out attribution runs require --evaluation_source test")
+        if args.controller in {"lmss_openrouter", "frozen_lmss"} and not args.lmss_model:
+            ap.error(
+                "attribution live and frozen LMSS runs require an explicit --lmss_model identifier"
+            )
+    elif args.blocks_per_stage != 1:
+        ap.error("--blocks_per_stage other than 1 requires --attribution_protocol")
+    if args.attribution_smoke and not args.attribution_protocol:
+        ap.error("--attribution_smoke requires --attribution_protocol")
+    if args.controller == "frozen_lmss" and not args.frozen_action_schedule:
+        ap.error("--controller frozen_lmss requires --frozen_action_schedule")
+    if args.controller == "frozen_lmss" and not args.attribution_protocol:
+        ap.error("--controller frozen_lmss is only valid with --attribution_protocol")
+    if args.controller != "frozen_lmss" and args.frozen_action_schedule:
+        ap.error("--frozen_action_schedule is only valid with --controller frozen_lmss")
+    if args.save_attribution_stage0 and args.resume_attribution_stage0:
+        ap.error("stage-0 checkpoint save and resume are mutually exclusive")
+    if (args.save_attribution_stage0 or args.resume_attribution_stage0) and not args.attribution_protocol:
+        ap.error("attribution stage-0 checkpoints require --attribution_protocol")
+    if args.resume_checkpoint and args.resume_attribution_stage0:
+        ap.error("legacy and attribution checkpoint resume cannot be combined")
+
     if args.capture_common_checkpoints:
         if args.controller != "fixed" or args.optimizer != "adam":
             ap.error("common-checkpoint parent requires fixed controller and Adam")
@@ -584,14 +739,15 @@ def main():
         )
 
     branching_mode = bool(args.capture_common_checkpoints or args.resume_checkpoint)
-    if branching_mode:
+    if branching_mode or args.attribution_protocol:
         torch.use_deterministic_algorithms(True)
         if args.device in {"cuda", "auto"} and torch.cuda.is_available():
             if os.environ.get("CUBLAS_WORKSPACE_CONFIG") not in {":4096:8", ":16:8"}:
                 ap.error(
-                    "deterministic CUDA branching requires "
+                    "deterministic CUDA branching/attribution requires "
                     "CUBLAS_WORKSPACE_CONFIG=:4096:8 (set it before Python starts)"
                 )
+    set_seeds(args.seed)
 
     if args.update_control == "projection" and args.projection_lambda != 0.0:
         if args.controller != "fixed":
@@ -620,8 +776,10 @@ def main():
 
     controller_name_map = {
         "v4": "ControllerV4",
+        "rules_joint": "RulesJoint",
         "mock": "Mock",
         "fixed": "Fixed",
+        "frozen_lmss": "FrozenLMSS",
         "sft": "SFT_v0",
         "lmss_api": "LMSS_API",
         "lmss_local": "LMSS_LOCAL",
@@ -641,25 +799,96 @@ def main():
     resume_metadata = None
     if args.resume_checkpoint:
         resume_payload, resume_metadata = load_checkpoint(args.resume_checkpoint)
+    attribution_stage0_payload = None
+    attribution_stage0_metadata = None
+    if args.resume_attribution_stage0:
+        attribution_stage0_payload, attribution_stage0_metadata = load_checkpoint(
+            args.resume_attribution_stage0
+        )
 
     protocol_fields = (
         "clients", "alpha", "epochs", "rounds", "batch_size", "lr",
         "subset_per_client", "seed", "split_mode", "val_size", "cl_batches",
-        "num_workers", "optimizer", "early_patience", "controller",
+        "stream_mode", "attribution_protocol", "attribution_smoke",
+        "blocks_per_stage", "domain_order",
+        "evaluation_source",
+        "control_mode", "num_workers", "optimizer", "early_patience", "controller",
+        "lmss_model", "frozen_action_schedule",
         "measure_subspaces", "subspace_energy", "subspace_max_rank",
         "subspace_samples_per_batch", "subspace_samples_per_phase",
-        "update_control",
+        "update_control", "projection_lambda", "shrinkage_schedule",
     )
     protocol = {name: getattr(args, name) for name in protocol_fields}
+    if args.controller in {"lmss_openrouter", "frozen_lmss"}:
+        protocol["resolved_lmss_model"] = (
+            args.lmss_model
+            or (
+                "openai/gpt-4o-mini"
+                if args.attribution_protocol
+                else "Qwen/Qwen2.5-0.5B-Instruct"
+            )
+        )
+    elif args.controller == "lmss_local":
+        protocol["resolved_lmss_model"] = (
+            args.lmss_model or "Qwen/Qwen2.5-0.5B-Instruct"
+        )
+    frozen_actions = None
+    frozen_schedule_sha256 = None
+    frozen_schedule_provenance = None
     code_paths = (
         "src/run_llm_fcl_controller.py",
         "src/checkpointing.py",
         "src/fl.py",
+        "src/model.py",
+        "src/agent_io.py",
         "src/strategies/replay.py",
+        "src/data_il_streams.py",
+        "src/attribution_protocol.py",
+        "src/policy/lmss_openrouter.py",
         "src/instrumentation/subspace.py",
     )
+    attribution_common_protocol = {
+        key: value
+        for key, value in protocol.items()
+        if key not in {
+            "controller",
+            "control_mode",
+            "lmss_model",
+            "resolved_lmss_model",
+            "frozen_action_schedule",
+            "frozen_action_schedule_sha256",
+        }
+    }
+    attribution_stage0_manifest = protocol_manifest(
+        attribution_common_protocol, code_paths
+    )
+    attribution_run_manifest = (
+        protocol_manifest(protocol, code_paths)
+        if args.attribution_protocol
+        else None
+    )
+    if args.controller == "frozen_lmss":
+        first_adaptive_round = args.blocks_per_stage
+        (
+            frozen_actions,
+            frozen_schedule_sha256,
+            frozen_schedule_provenance,
+        ) = load_frozen_action_schedule(
+            args.frozen_action_schedule,
+            range(first_adaptive_round, args.rounds),
+        )
+        validate_frozen_schedule_provenance(
+            frozen_actions,
+            frozen_schedule_provenance,
+            expected_model=protocol["resolved_lmss_model"],
+            expected_palette=STRATEGY_PALETTE,
+            expected_policy_sha256=attribution_run_manifest["code"][
+                "files_sha256"
+            ]["src/policy/lmss_openrouter.py"],
+        )
+        protocol["frozen_action_schedule_sha256"] = frozen_schedule_sha256
+        attribution_run_manifest = protocol_manifest(protocol, code_paths)
     
-    set_seeds(args.seed)
     # safe device selection with fallback for mac (no CUDA)
     if args.device == "auto":
         if torch.cuda.is_available():
@@ -711,6 +940,12 @@ def main():
         trainset_full = datasets.CIFAR100(root="./data", train=True, download=True, transform=None)
         testset = datasets.CIFAR100(root="./data", train=False, download=True, transform=None)
 
+    controlled_domain_order = (
+        resolve_domain_order(args.domain_order, len(CONTROLLED_DOMAIN_TRANSFORMS))
+        if args.stream_mode == "controlled_domain_shift"
+        else tuple(range(args.cl_batches))
+    )
+
     total_train = len(trainset_full)  # 50_000
     val_size = args.val_size          # 5_000
     train_size = total_train - val_size
@@ -749,6 +984,28 @@ def main():
             for stage in range(len(CONTROLLED_DOMAIN_TRANSFORMS))
         ]
     )
+    domain_val_loaders = (
+        None
+        if args.stream_mode == "random_chunks"
+        else [
+            DataLoader(
+                StageDomainDataset(
+                    trainset_full,
+                    val_indices,
+                    stage=domain,
+                    experiment_seed=args.seed,
+                ),
+                batch_size=256,
+                shuffle=False,
+                num_workers=args.num_workers,
+                pin_memory=True,
+            )
+            for domain in range(len(CONTROLLED_DOMAIN_TRANSFORMS))
+        ]
+    )
+    if args.evaluation_source == "validation":
+        test_loader = val_loader
+        domain_test_loaders = domain_val_loaders
 
     print(f"[Split] train={len(train_indices)} val={len(val_indices)} test={len(testset)}", flush=True)
 
@@ -826,8 +1083,10 @@ def main():
         for i, b in enumerate(batches, start=1):
             row = {"run_id": "", "client": cid, "cl_batch": i, "size": len(b)}
             if args.stream_mode == "controlled_domain_shift":
+                domain_id = controlled_domain_order[i - 1]
                 row["stream_mode"] = args.stream_mode
-                row["stage_transform"] = CONTROLLED_DOMAIN_TRANSFORMS[i - 1]["name"]
+                row["domain_id"] = int(domain_id)
+                row["stage_transform"] = CONTROLLED_DOMAIN_TRANSFORMS[domain_id]["name"]
             cl_rows.append(row)
 
     if args.stream_mode == "controlled_domain_shift":
@@ -835,6 +1094,12 @@ def main():
             "stream_mode": args.stream_mode,
             "seed": int(args.seed),
             "stage_transforms": list(CONTROLLED_DOMAIN_TRANSFORMS),
+            "domain_order_name": args.domain_order,
+            "domain_order": list(controlled_domain_order),
+            "ordered_stage_transforms": [
+                CONTROLLED_DOMAIN_TRANSFORMS[domain]["name"]
+                for domain in controlled_domain_order
+            ],
             "stage_sizes_by_client": [[len(batch) for batch in batches] for batches in cl_schedule],
             "per_stage_class_counts_by_client": [
                 stage_class_counts(batches, targets) for batches in cl_schedule
@@ -855,12 +1120,55 @@ def main():
         data_state["controlled_domain_shift"] = {
             "seed": int(args.seed),
             "stage_transforms": list(CONTROLLED_DOMAIN_TRANSFORMS),
+            "domain_order_name": args.domain_order,
+            "domain_order": list(controlled_domain_order),
         }
     if resume_payload is not None:
         checkpoint_manifest = resume_payload.get("manifest", {})
         validate_resume_protocol(checkpoint_manifest.get("protocol", {}), protocol)
         if resume_payload.get("data_state") != data_state:
             raise RuntimeError("train/validation split, client split, or CL schedule differs")
+    if attribution_stage0_payload is not None:
+        checkpoint_protocol = attribution_stage0_payload.get("manifest", {}).get(
+            "protocol", {}
+        )
+        if checkpoint_protocol != attribution_common_protocol:
+            raise RuntimeError("attribution stage-0 checkpoint protocol differs")
+        checkpoint_hashes = attribution_stage0_payload.get("manifest", {}).get(
+            "code", {}
+        ).get("files_sha256", {})
+        current_hashes = attribution_stage0_manifest.get("code", {}).get(
+            "files_sha256", {}
+        )
+        if checkpoint_hashes != current_hashes:
+            raise RuntimeError("attribution stage-0 checkpoint code hashes differ")
+        environment_keys = (
+            "python", "torch", "numpy", "cuda_runtime", "cudnn",
+            "cuda_device_count", "cuda_devices", "cudnn_deterministic",
+            "cudnn_benchmark", "deterministic_algorithms",
+            "cublas_workspace_config",
+        )
+        checkpoint_environment = attribution_stage0_payload.get("manifest", {}).get(
+            "environment", {}
+        )
+        current_environment = attribution_stage0_manifest.get("environment", {})
+        environment_differences = {
+            key: {
+                "checkpoint": checkpoint_environment.get(key),
+                "current": current_environment.get(key),
+            }
+            for key in environment_keys
+            if checkpoint_environment.get(key) != current_environment.get(key)
+        }
+        if environment_differences:
+            raise RuntimeError(
+                "attribution stage-0 environment differs: "
+                f"{environment_differences}"
+            )
+        if attribution_stage0_payload.get("data_state") != data_state:
+            raise RuntimeError(
+                "attribution stage-0 train/validation split or stream differs"
+            )
 
     # Init clients
     clients = []
@@ -884,7 +1192,10 @@ def main():
             opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0)
         else:
             opt = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
-        replay = ReplayBuffer(capacity=2000)
+        replay = ReplayBuffer(
+            capacity=2000,
+            seed=(args.seed * 1000 + cid) if args.attribution_protocol else None,
+        )
         clients.append(Client(cid, model, opt, loader, device=device, replay=replay,
                               val_loader=val_loader, early_patience=args.early_patience))
 
@@ -1002,7 +1313,21 @@ def main():
     forgetting = np.zeros_like(per_class)
     global_loss = evaluate_loss(global_model, device, test_loader)
     ema_loss = global_loss
+    feedback_loader = (
+        domain_val_loaders[controlled_domain_order[0]]
+        if domain_val_loaders is not None
+        else val_loader
+    )
+    feedback_acc, feedback_per_class = evaluate(global_model, device, feedback_loader)
+    feedback_loss = evaluate_loss(global_model, device, feedback_loader)
+    feedback_ema_loss = feedback_loss
+    feedback_last_acc = feedback_acc
+    feedback_forgetting = np.zeros(1, dtype=np.float32)
+    best_feedback_domain_accuracy = [0.0] * len(CONTROLLED_DOMAIN_TRANSFORMS)
+    best_feedback_domain_accuracy[controlled_domain_order[0]] = float(feedback_acc)
     div_norm = 0.0
+    mean_update_distance = 0.0
+    relative_update_dispersion = 0.0
 
     # --- comm accounting: approximate model size in bytes (FP32 unless changed) ---
     def _model_num_params_bytes(model) -> int:
@@ -1035,6 +1360,18 @@ def main():
 
     io_root = str(output_dir / "runs" / run_id)
     os.makedirs(io_root, exist_ok=True)
+    if args.attribution_protocol:
+        run_protocol = {
+            "manifest": attribution_run_manifest,
+            "strategy_palette": {
+                str(key): value for key, value in STRATEGY_PALETTE.items()
+            },
+            "frozen_schedule_sha256": frozen_schedule_sha256,
+        }
+        Path(io_root, "run_protocol.json").write_text(
+            json.dumps(run_protocol, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
     def _build_state(round_id, acc_global, loss_global, ema_loss, forget_mean, forget_max, divergence, bytes_last_round, client_snapshots):
         return {
@@ -1066,6 +1403,12 @@ def main():
     # --- metrics accumulators ---
     acc_hist = []            # for AULC
     comm_bytes_cum = 0       # cumulative comm
+    seen_domain_u_sum = 0.0
+    seen_domain_u_count = 0
+    controller_calls_cum = 0
+    controller_tokens_cum = 0
+    controller_latency_cum = 0.0
+    controller_cost_cum = 0.0
 
     parent_run_id = run_id
     start_round = 0
@@ -1092,7 +1435,23 @@ def main():
         forgetting = metrics["forgetting"].copy()
         global_loss = metrics["global_loss"]
         ema_loss = metrics["ema_loss"]
+        feedback_acc = metrics.get("feedback_acc", acc)
+        feedback_per_class = metrics.get("feedback_per_class", per_class).copy()
+        feedback_loss = metrics.get("feedback_loss", global_loss)
+        feedback_ema_loss = metrics.get("feedback_ema_loss", ema_loss)
+        feedback_last_acc = metrics.get("feedback_last_acc", feedback_acc)
+        feedback_forgetting = metrics.get(
+            "feedback_forgetting", np.zeros(1, dtype=np.float32)
+        ).copy()
+        best_feedback_domain_accuracy = copy.deepcopy(
+            metrics.get("best_feedback_domain_accuracy", best_feedback_domain_accuracy)
+        )
+        best_domain_accuracy = copy.deepcopy(
+            metrics.get("best_domain_accuracy", best_domain_accuracy)
+        )
         div_norm = metrics["div_norm"]
+        mean_update_distance = metrics.get("mean_update_distance", 0.0)
+        relative_update_dispersion = metrics.get("relative_update_dispersion", 0.0)
         last_acc = metrics["last_acc"]
         last_hp = copy.deepcopy(metrics["last_hp"])
         best_global_acc = metrics["best_global_acc"]
@@ -1106,6 +1465,12 @@ def main():
         bytes_cum = metrics["bytes_cum"]
         acc_hist = copy.deepcopy(metrics["acc_hist"])
         comm_bytes_cum = metrics["comm_bytes_cum"]
+        seen_domain_u_sum = metrics.get("seen_domain_u_sum", 0.0)
+        seen_domain_u_count = metrics.get("seen_domain_u_count", 0)
+        controller_calls_cum = metrics.get("controller_calls_cum", 0)
+        controller_tokens_cum = metrics.get("controller_tokens_cum", 0)
+        controller_latency_cum = metrics.get("controller_latency_cum", 0.0)
+        controller_cost_cum = metrics.get("controller_cost_cum", 0.0)
 
         start_round = int(resume_payload["next_round"])
         if start_round not in {1, 5}:
@@ -1172,6 +1537,73 @@ def main():
                 branch_local_epochs=args.branch_local_epochs,
             )
 
+    if attribution_stage0_payload is not None:
+        global_model.load_state_dict(attribution_stage0_payload["global_model"])
+        if len(attribution_stage0_payload["clients"]) != len(clients):
+            raise RuntimeError("attribution stage-0 client count differs")
+        for client, saved in zip(clients, attribution_stage0_payload["clients"]):
+            if int(saved["cid"]) != int(client.cid):
+                raise RuntimeError("attribution stage-0 client ordering differs")
+            client.optimizer.load_state_dict(saved["optimizer"])
+            client.replay.load_state_dict(saved["replay"])
+            client.load_persistent_state_dict(saved["persistent"])
+            client.update_energy_rows = []
+
+        metrics = attribution_stage0_payload["metrics"]
+        acc = metrics["acc"]
+        per_class = metrics["per_class"].copy()
+        best_recall = metrics["best_recall"].copy()
+        forgetting = metrics["forgetting"].copy()
+        global_loss = metrics["global_loss"]
+        ema_loss = metrics["ema_loss"]
+        feedback_acc = metrics["feedback_acc"]
+        feedback_per_class = metrics["feedback_per_class"].copy()
+        feedback_loss = metrics["feedback_loss"]
+        feedback_ema_loss = metrics["feedback_ema_loss"]
+        feedback_last_acc = metrics["feedback_last_acc"]
+        feedback_forgetting = metrics["feedback_forgetting"].copy()
+        best_feedback_domain_accuracy = copy.deepcopy(
+            metrics["best_feedback_domain_accuracy"]
+        )
+        best_domain_accuracy = copy.deepcopy(metrics["best_domain_accuracy"])
+        div_norm = metrics["div_norm"]
+        mean_update_distance = metrics["mean_update_distance"]
+        relative_update_dispersion = metrics["relative_update_dispersion"]
+        last_acc = metrics["last_acc"]
+        last_hp = copy.deepcopy(metrics["last_hp"])
+        best_global_acc = metrics["best_global_acc"]
+        best_state = copy.deepcopy(metrics["best_state"])
+        best_hp = copy.deepcopy(metrics["best_hp"])
+        best_round = metrics["best_round"]
+        rollback_flag = metrics["rollback_flag"]
+        rollback_round = metrics["rollback_round"]
+        aulc_running = metrics["aulc_running"]
+        bytes_last_round = metrics["bytes_last_round"]
+        bytes_cum = metrics["bytes_cum"]
+        acc_hist = copy.deepcopy(metrics["acc_hist"])
+        comm_bytes_cum = metrics["comm_bytes_cum"]
+        seen_domain_u_sum = metrics["seen_domain_u_sum"]
+        seen_domain_u_count = metrics["seen_domain_u_count"]
+        controller_calls_cum = metrics["controller_calls_cum"]
+        controller_tokens_cum = metrics["controller_tokens_cum"]
+        controller_latency_cum = metrics["controller_latency_cum"]
+        controller_cost_cum = metrics["controller_cost_cum"]
+
+        start_round = int(attribution_stage0_payload["next_round"])
+        if start_round != args.blocks_per_stage:
+            raise RuntimeError(
+                "attribution stage-0 checkpoint must resume at the first stage-1 block"
+            )
+        parent_run_id = str(attribution_stage0_payload["parent_run_id"])
+        source_checkpoint_sha256 = attribution_stage0_metadata["sha256"]
+        restore_rng_state(attribution_stage0_payload["rng"], g)
+        del attribution_stage0_payload
+        print(
+            f"[Attribution checkpoint] restored parent={parent_run_id} "
+            f"pre-round={start_round} sha256={source_checkpoint_sha256}",
+            flush=True,
+        )
+
     stop_round = start_round + 1 if args.one_round else args.rounds
     captured_checkpoint_metadata = {}
     branch_client_epoch_counts = {int(client.cid): 0 for client in clients}
@@ -1185,7 +1617,19 @@ def main():
             "forgetting": forgetting.copy(),
             "global_loss": float(global_loss),
             "ema_loss": float(ema_loss),
+            "feedback_acc": float(feedback_acc),
+            "feedback_per_class": feedback_per_class.copy(),
+            "feedback_loss": float(feedback_loss),
+            "feedback_ema_loss": float(feedback_ema_loss),
+            "feedback_last_acc": float(feedback_last_acc),
+            "feedback_forgetting": feedback_forgetting.copy(),
+            "best_feedback_domain_accuracy": copy.deepcopy(
+                best_feedback_domain_accuracy
+            ),
+            "best_domain_accuracy": copy.deepcopy(best_domain_accuracy),
             "div_norm": float(div_norm),
+            "mean_update_distance": float(mean_update_distance),
+            "relative_update_dispersion": float(relative_update_dispersion),
             "last_acc": float(last_acc),
             "last_hp": copy.deepcopy(last_hp),
             "best_global_acc": float(best_global_acc),
@@ -1199,6 +1643,12 @@ def main():
             "bytes_cum": int(bytes_cum),
             "acc_hist": copy.deepcopy(acc_hist),
             "comm_bytes_cum": int(comm_bytes_cum),
+            "seen_domain_u_sum": float(seen_domain_u_sum),
+            "seen_domain_u_count": int(seen_domain_u_count),
+            "controller_calls_cum": int(controller_calls_cum),
+            "controller_tokens_cum": int(controller_tokens_cum),
+            "controller_latency_cum": float(controller_latency_cum),
+            "controller_cost_cum": float(controller_cost_cum),
         }
 
     def _checkpoint_payload(next_round):
@@ -1227,11 +1677,16 @@ def main():
 
     for r in range(start_round, stop_round):
 
+        stage_position, block_id = stage_and_block(r, args.blocks_per_stage)
+        if stage_position >= args.cl_batches:
+            raise RuntimeError("round schedule exceeds the configured continual stages")
+        domain_id = int(controlled_domain_order[stage_position])
+
         # ---- Broadcast global model to all clients (FedAvg step 1) ----
         for c in clients:
             c.model.load_state_dict(global_model.state_dict())
         
-        acc_delta = float(acc - last_acc)
+        acc_delta = float(feedback_acc - feedback_last_acc)
 
         # --- Build and write STATE JSON (once, at round start) ---
         client_snaps = []
@@ -1244,12 +1699,15 @@ def main():
 
             # new batch size for THIS round for this client (size of incoming CL chunk)
             batches = cl_schedule[c.cid]
-            nb = len(batches[r]) if r < len(batches) else len(batches[-1])
+            nb = len(batches[stage_position])
 
+            client_vacc = float(getattr(c, "_last_vacc", float("nan")))
+            if args.attribution_protocol and np.isfinite(client_vacc):
+                client_vacc /= 100.0
             client_snaps.append({
                 "id": int(c.cid),
                 "vloss": float(getattr(c, "_last_vloss", float("nan"))),
-                "vacc": float(getattr(c, "_last_vacc", float("nan"))),
+                "vacc": client_vacc,
                 "new_batch_size": int(nb),
                 "replay_capacity": int(getattr(getattr(c, "replay", None), "capacity", 2000)),
                 "last_lr": _lr_snapshot,
@@ -1259,25 +1717,54 @@ def main():
 
         state = {
             "round_id": int(r),
+            "stage_id": int(stage_position),
+            "block_id": int(block_id),
+            "domain_id": int(domain_id),
             "global": {
-                "acc": float(acc),
-                "last_acc": float(last_acc),
-                "loss": float(global_loss),
-                "ema_loss": float(ema_loss),
-                "forget_mean": float(np.mean(forgetting)) if forgetting is not None else 0.0,
-                "forget_max": float(np.max(forgetting)) if forgetting is not None else 0.0,
+                "acc": float(feedback_acc),
+                "last_acc": float(feedback_last_acc),
+                "loss": float(feedback_loss),
+                "ema_loss": float(feedback_ema_loss),
+                "forget_mean": float(np.mean(feedback_forgetting)),
+                "forget_max": float(np.max(feedback_forgetting)),
                 "divergence": float(div_norm),
                 "bytes_last_round": int(bytes_last_round),
                 "bytes_cum": int(bytes_cum),
             },
             "clients": client_snaps,
         }
+        if args.attribution_protocol:
+            state["accuracy_unit"] = "fraction"
         write_state_json(io_root, r, state)
 
         # =========================================================
         # Decide action ONCE (by controller) -> validate ONCE
         # =========================================================
-        if args.controller == "sft":
+        if args.attribution_protocol and stage_position == 0:
+            candidate = {
+                "lr": float(args.lr),
+                "client_selection_k": len(clients),
+                "aggregation": {"method": "FedAvg"},
+                "client_params": [
+                    {
+                        "id": int(c.cid),
+                        "replay_ratio": 0.50,
+                        "lr_scale": 1.0,
+                        "ewc_lambda": 0.0,
+                    }
+                    for c in clients
+                ],
+            }
+            action = validate_action(
+                candidate,
+                n_clients=len(clients),
+                policy_source="AttributionStage0Fixed",
+            )
+            hp_lr = float(args.lr)
+            rep = 0.50
+            hp_notes = "attribution protocol: fixed stage 0"
+
+        elif args.controller == "sft":
             # SFT: the tiny local LM returns JSON; we validate & clamp it.
             print(f"[DEBUG] Calling SFT controller at round {r}", flush=True)
             raw = sft_decide_action(state, model_dir="models/sft_distilgpt2_v2")
@@ -1308,7 +1795,7 @@ def main():
             raw = lmss_decide_action_local(
                 state,
                 compact_state_fn=_compact_state_for_sft,
-                model_name=getattr(args, "lmss_model", "Qwen/Qwen2.5-0.5B-Instruct"),
+                model_name=args.lmss_model or "Qwen/Qwen2.5-0.5B-Instruct",
             )
             action = validate_action(raw, n_clients=len(clients), policy_source=raw.get("policy_source", "LMSS_LOCAL"))
             hp_lr = float(raw.get("lr", args.lr))
@@ -1316,21 +1803,36 @@ def main():
             hp_notes = raw.get("policy_source", "LMSS_LOCAL")
 
         elif args.controller == "lmss_openrouter":
+            openrouter_model = (
+                args.lmss_model
+                or (
+                    "openai/gpt-4o-mini"
+                    if args.attribution_protocol
+                    else "Qwen/Qwen2.5-0.5B-Instruct"
+                )
+            )
             raw = lmss_decide_action_openrouter(
                 state,
                 compact_state_fn=_compact_state_for_sft,
-                model=getattr(args, "lmss_model", "openai/gpt-4o-mini"),
+                model=openrouter_model,
+                deterministic=args.attribution_protocol,
             )
+            if args.attribution_protocol and raw.get(
+                "controller_metadata", {}
+            ).get("fallback") is not False:
+                raise RuntimeError(
+                    "attribution LMSS call failed or fell back; discard this run"
+                )
             action = validate_action(raw, n_clients=len(clients), policy_source=raw.get("policy_source", "LMSS_OPENROUTER"))
             hp_lr = float(raw.get("lr", args.lr))
             rep = float(action["client_params"][0]["replay_ratio"]) if action["client_params"] else 0.50
             hp_notes = raw.get("policy_source", "LMSS_OPENROUTER")
 
-        elif args.controller == "v4":
+        elif args.controller in {"v4", "rules_joint"}:
             # Controller V4: compute hp (lr/rep) from simple signals
-            dacc = float(acc - last_acc)
-            F_t  = float(np.mean(forgetting)) if forgetting is not None else 0.0
-            L_ema = float(ema_loss)
+            dacc = float(feedback_acc - feedback_last_acc)
+            F_t  = float(np.mean(feedback_forgetting))
+            L_ema = float(feedback_ema_loss)
             div   = float(div_norm)
 
             if rollback_flag:
@@ -1369,35 +1871,52 @@ def main():
             rep = max(V4_REP_MIN, min(V4_REP_MAX, rep))
             notes.append(f"clamped(lr∈[{V4_LR_MIN},{V4_LR_MAX}], rep∈[{V4_REP_MIN:.2f},{V4_REP_MAX:.2f}])")
 
-            # build per-client scales by vloss rank (higher loss → lower scale)
-            vlosses = []
-            for c in clients:
-                v = getattr(c, "_last_vloss", None)
-                vlosses.append(float(v) if v is not None and not np.isnan(v) else float(global_loss))
-            vl_min, vl_max = float(np.min(vlosses)), float(np.max(vlosses))
-            rng_v = max(1e-8, vl_max - vl_min)
-
-            # --- ✅ WARMUP FIX: force lr_scale=1.0 during warmup rounds ---
-            if r < V4_WARMUP_ROUNDS:
+            if args.controller == "rules_joint":
+                strategy_id = nearest_strategy_id(
+                    target_lr=lr,
+                    target_replay_ratio=rep,
+                    palette=STRATEGY_PALETTE,
+                )
+                strategy = STRATEGY_PALETTE[strategy_id]
+                lr = float(strategy["lr"])
+                rep = float(strategy["replay_ratio"])
                 lr_scales = [1.0 for _ in clients]
-                notes.append("warmup: lr_scale forced to 1.0")
+                notes.append(f"projected_to_strategy={strategy_id}")
+                policy_source = f"RulesJoint_STRAT_{strategy_id}"
             else:
-                lr_scales = [
-                    float(
-                        max(
-                            V4_CLIENT_LR_MIN,
-                            min(
-                                V4_CLIENT_LR_MAX,
-                                V4_CLIENT_LR_MIN
-                                + (1.0 - ((vlosses[i] - vl_min) / rng_v))
-                                * (V4_CLIENT_LR_MAX - V4_CLIENT_LR_MIN),
-                            ),
-                        )
+                # Legacy V4 behaviour is retained outside the matched study.
+                vlosses = []
+                for c in clients:
+                    v = getattr(c, "_last_vloss", None)
+                    vlosses.append(
+                        float(v)
+                        if v is not None and not np.isnan(v)
+                        else float(feedback_loss)
                     )
-                    for i in range(len(clients))
-                ]
+                vl_min, vl_max = float(np.min(vlosses)), float(np.max(vlosses))
+                rng_v = max(1e-8, vl_max - vl_min)
+                if r < V4_WARMUP_ROUNDS:
+                    lr_scales = [1.0 for _ in clients]
+                    notes.append("warmup: lr_scale forced to 1.0")
+                else:
+                    lr_scales = [
+                        float(
+                            max(
+                                V4_CLIENT_LR_MIN,
+                                min(
+                                    V4_CLIENT_LR_MAX,
+                                    V4_CLIENT_LR_MIN
+                                    + (1.0 - ((vlosses[i] - vl_min) / rng_v))
+                                    * (V4_CLIENT_LR_MAX - V4_CLIENT_LR_MIN),
+                                ),
+                            )
+                        )
+                        for i in range(len(clients))
+                    ]
+                policy_source = "ControllerV4"
 
             candidate = {
+                "lr": float(lr),
                 "client_selection_k": len(clients),
                 "aggregation": {"method": "FedAvg"},
                 "client_params": [
@@ -1411,7 +1930,11 @@ def main():
                 ],
             }
 
-            action = validate_action(candidate, n_clients=len(clients), policy_source="ControllerV4")
+            action = validate_action(
+                candidate,
+                n_clients=len(clients),
+                policy_source=policy_source,
+            )
             hp_lr = float(lr)
             hp_notes = " | ".join(notes)
             
@@ -1429,8 +1952,50 @@ def main():
             hp_lr = float(args.lr)
             rep = 0.50
             hp_notes = "fixed (paper CL default)"
+        elif args.controller == "frozen_lmss":
+            raw = copy.deepcopy(frozen_actions[r])
+            raw.pop("controller_metadata", None)
+            action = validate_action(
+                raw,
+                n_clients=len(clients),
+                policy_source="FrozenLMSS",
+            )
+            hp_lr = float(raw.get("lr", args.lr))
+            rep = (
+                float(action["client_params"][0]["replay_ratio"])
+                if action.get("client_params")
+                else 0.50
+            )
+            hp_notes = f"frozen development schedule {frozen_schedule_sha256[:12]}"
         else:
             raise ValueError(f"Unknown controller: {args.controller}")
+
+        if args.attribution_protocol:
+            action = restrict_action_axis(
+                action,
+                mode=args.control_mode,
+                n_clients=len(clients),
+                fixed_lr=args.lr,
+                fixed_replay_ratio=0.50,
+            )
+            hp_lr = float(action["lr"])
+            rep = float(action["client_params"][0]["replay_ratio"])
+            hp_notes = f"{hp_notes} | control_mode={args.control_mode}"
+
+        controller_metadata = copy.deepcopy(action.get("controller_metadata", {}))
+        controller_calls = int(controller_metadata.get("call_count", 0) or 0)
+        controller_tokens = int(controller_metadata.get("total_tokens", 0) or 0)
+        controller_latency = float(
+            controller_metadata.get("latency_seconds", 0.0) or 0.0
+        )
+        billed_cost_value = controller_metadata.get("billed_cost")
+        controller_cost = (
+            float(billed_cost_value) if billed_cost_value is not None else 0.0
+        )
+        controller_calls_cum += controller_calls
+        controller_tokens_cum += controller_tokens
+        controller_latency_cum += controller_latency
+        controller_cost_cum += controller_cost
 
         # =========================================================
         # Apply the validated ACTION uniformly (HP + per-client LR)
@@ -1450,9 +2015,11 @@ def main():
             c._last_lr_scale = float(scale)
 
         # policy line for logs
-        F_t_print = float(np.mean(forgetting)) if forgetting is not None else 0.0
+        F_t_print = float(np.mean(feedback_forgetting))
         print(
-            f"[Policy r={r}] acc={acc:.3f} dacc={acc_delta:+.3f} F_t={F_t_print:.3f} Div={div_norm:.3f} "
+            f"[Policy r={r} stage={stage_position} block={block_id}] "
+            f"val_acc={feedback_acc:.3f} dacc={acc_delta:+.3f} "
+            f"F_t={F_t_print:.3f} Div={div_norm:.3f} "
             f"-> lr={hp['lr']:.5f}, replay={hp['replay_ratio']:.2f} ({hp['notes']})",
             flush=True,
         )
@@ -1466,18 +2033,19 @@ def main():
         # =========================================================
         # Local training per client
         # =========================================================
-        phase_id = min(r, args.cl_batches - 1)
+        phase_id = stage_position
         if subspace_instrumentation is not None:
             subspace_instrumentation.begin_round(phase_id)
 
+        round_current_presentations = 0
+        round_replay_presentations = 0
+        round_optimizer_steps_before = sum(c._optimizer_step for c in clients)
+        round_memory_admissions = 0
+
         for c in clients:
             batches = cl_schedule[c.cid]
-            if r < len(batches):
-                batch_indices = batches[r]
-                batch_id = r
-            else:
-                batch_indices = batches[-1]
-                batch_id = len(batches) - 1
+            batch_indices = batches[stage_position]
+            batch_id = stage_position
 
             stage_dataset = (
                 Subset(trainset_full, batch_indices)
@@ -1485,11 +2053,13 @@ def main():
                 else StageDomainDataset(
                     trainset_full,
                     batch_indices,
-                    stage=min(r, args.cl_batches - 1),
+                    stage=domain_id,
                     experiment_seed=args.seed,
                     training=True,
                 )
             )
+            if domain_val_loaders is not None:
+                c.val_loader = domain_val_loaders[domain_id]
             c.loader = DataLoader(
                 stage_dataset,
                 batch_size=args.batch_size,
@@ -1504,7 +2074,11 @@ def main():
                   f"(new={len(batch_indices)}; replay≈{hp['replay_ratio']:.2f}, LR_scale={c._last_lr_scale:.2f})",
                   flush=True)
 
-            epoch_budget = local_epoch_budget(args.epochs, args.branch_local_epochs)
+            epoch_budget = (
+                block_epoch_budget(args.epochs, args.blocks_per_stage, block_id)
+                if args.attribution_protocol
+                else local_epoch_budget(args.epochs, args.branch_local_epochs)
+            )
             for e in range(epoch_budget):
                 avg_loss, epoch_acc, stop = c.train_one_epoch(
                     replay_ratio=hp["replay_ratio"],
@@ -1522,7 +2096,10 @@ def main():
                         else None
                     ),
                     round_id=r,
+                    fixed_batch_budget=args.attribution_protocol,
                 )
+                round_current_presentations += c._last_current_presentations
+                round_replay_presentations += c._last_replay_presentations
                 run_logs.append({
                     "run_id": run_id, "tag": args.tag, "round": r, "client": c.cid,
                     "epoch": e + 1,
@@ -1534,13 +2111,41 @@ def main():
                     "train_acc": float(epoch_acc),
                     "val_loss": float(getattr(c, "_last_vloss", float("nan"))),
                     "val_acc": float(getattr(c, "_last_vacc", float("nan"))),
+                    "current_presentations": int(c._last_current_presentations),
+                    "replay_presentations": int(c._last_replay_presentations),
                 })
                 if args.resume_checkpoint:
                     branch_client_epoch_counts[int(c.cid)] += 1
                     branch_client_optimizer_step_counts[int(c.cid)] += len(c.loader)
-                if should_stop_local_training(stop, args.branch_local_epochs):
+                if (
+                    not args.attribution_protocol
+                    and should_stop_local_training(stop, args.branch_local_epochs)
+                ):
                     print(f"[Client {c.cid}] Early stopping (patience {c.early_patience})", flush=True)
                     break
+
+            if args.attribution_protocol and block_id == args.blocks_per_stage - 1:
+                memory_dataset = StageDomainDataset(
+                    trainset_full,
+                    batch_indices,
+                    stage=domain_id,
+                    experiment_seed=args.seed,
+                    training=False,
+                )
+                memory_loader = DataLoader(
+                    memory_dataset,
+                    batch_size=args.batch_size,
+                    shuffle=False,
+                    num_workers=args.num_workers,
+                    pin_memory=True,
+                )
+                for memory_x, memory_y in memory_loader:
+                    c.replay.add_batch(memory_x, memory_y)
+                    round_memory_admissions += int(memory_y.numel())
+
+        round_optimizer_steps = (
+            sum(c._optimizer_step for c in clients) - round_optimizer_steps_before
+        )
 
         subspace_metrics = {}
         if subspace_instrumentation is not None:
@@ -1564,10 +2169,14 @@ def main():
             for c in clients:
                 c_flat = flat_params(c.model)
                 dists.append(torch.norm(c_flat - g_flat, p=2).item())
-            if len(dists) > 1:
-                div_norm = float(np.std(dists) / (np.median(dists) + 1e-8))
-            else:
-                div_norm = 0.0
+            mean_update_distance = float(np.mean(dists)) if dists else 0.0
+            global_parameter_norm = float(torch.norm(g_flat, p=2).item())
+            div_norm = mean_update_distance / (global_parameter_norm + 1e-12)
+            relative_update_dispersion = (
+                float(np.std(dists) / (np.median(dists) + 1e-12))
+                if len(dists) > 1
+                else 0.0
+            )
 
         # ---- Aggregate & evaluate ----
         global_model = server.average([c.model for c in clients])
@@ -1578,7 +2187,10 @@ def main():
         aulc_running = ((aulc_running * r) + float(acc)) / max(1, (r + 1))
 
         # ---- Rollback check ----
-        do_rollback = args.controller in ["v4", "lmss_local", "lmss_api", "lmss_openrouter", "sft"]
+        do_rollback = (
+            not args.attribution_protocol
+            and args.controller in ["v4", "lmss_local", "lmss_api", "lmss_openrouter", "sft"]
+        )
 
         if do_rollback and (acc < best_global_acc - V4_ROLLBACK_THR):
             global_model.load_state_dict(best_state)
@@ -1598,22 +2210,34 @@ def main():
 
         domain_metrics = None
         if domain_test_loaders is not None:
-            current_domain = min(r, len(domain_test_loaders) - 1)
             domain_accuracies = {}
             previous_retention = []
-            for domain in range(current_domain + 1):
+            seen_domains = [
+                int(controlled_domain_order[position])
+                for position in range(stage_position + 1)
+            ]
+            for domain in seen_domains:
                 domain_acc = float(acc) if domain == 0 else float(
                     evaluate(global_model, device, domain_test_loaders[domain])[0]
                 )
                 domain_accuracies[str(domain)] = domain_acc
-                if domain < current_domain and best_domain_accuracy[domain] > 0.0:
+                if domain != domain_id and best_domain_accuracy[domain] > 0.0:
                     previous_retention.append(domain_acc / best_domain_accuracy[domain])
                 best_domain_accuracy[domain] = max(best_domain_accuracy[domain], domain_acc)
-            previous_values = [domain_accuracies[str(domain)] for domain in range(current_domain)]
+            previous_values = [
+                domain_accuracies[str(domain)]
+                for domain in seen_domains
+                if domain != domain_id
+            ]
             domain_metrics = {
-                "current_domain": current_domain,
-                "current_domain_accuracy": domain_accuracies[str(current_domain)],
+                "stage_id": int(stage_position),
+                "block_id": int(block_id),
+                "current_domain": int(domain_id),
+                "current_domain_accuracy": domain_accuracies[str(domain_id)],
                 "seen_domain_accuracies": domain_accuracies,
+                "mean_seen_domain_accuracy": float(
+                    np.mean(list(domain_accuracies.values()))
+                ),
                 "mean_previous_domain_accuracy": (
                     float(np.mean(previous_values)) if previous_values else float("nan")
                 ),
@@ -1623,6 +2247,58 @@ def main():
             }
             controlled_stream_metadata["domain_evaluation_history"].append(
                 {"round": int(r), **domain_metrics}
+            )
+            seen_domain_u_sum, seen_domain_u_count = (
+                accumulate_post_initialization_utility(
+                    seen_domain_u_sum,
+                    seen_domain_u_count,
+                    stage_id=stage_position,
+                    mean_seen_domain_accuracy=domain_metrics[
+                        "mean_seen_domain_accuracy"
+                    ],
+                )
+            )
+
+        if domain_val_loaders is not None:
+            feedback_domain_accuracies = {}
+            feedback_drops = []
+            current_feedback_per_class = None
+            for seen_position in range(stage_position + 1):
+                seen_domain = int(controlled_domain_order[seen_position])
+                seen_acc, seen_per_class = evaluate(
+                    global_model, device, domain_val_loaders[seen_domain]
+                )
+                seen_acc = float(seen_acc)
+                if seen_domain == domain_id:
+                    current_feedback_per_class = seen_per_class
+                feedback_domain_accuracies[str(seen_domain)] = seen_acc
+                previous_best = best_feedback_domain_accuracy[seen_domain]
+                if previous_best > 0.0:
+                    feedback_drops.append(max(0.0, previous_best - seen_acc))
+                best_feedback_domain_accuracy[seen_domain] = max(previous_best, seen_acc)
+            feedback_last_acc = float(feedback_acc)
+            feedback_acc = float(np.mean(list(feedback_domain_accuracies.values())))
+            feedback_loss = evaluate_loss(
+                global_model, device, domain_val_loaders[domain_id]
+            )
+            feedback_ema_loss = (
+                V4_EMA_ALPHA * feedback_loss
+                + (1.0 - V4_EMA_ALPHA) * feedback_ema_loss
+            )
+            feedback_forgetting = np.asarray(
+                feedback_drops if feedback_drops else [0.0], dtype=np.float32
+            )
+            feedback_per_class = current_feedback_per_class
+        else:
+            feedback_last_acc = float(feedback_acc)
+            feedback_acc, feedback_per_class = evaluate(global_model, device, val_loader)
+            feedback_loss = evaluate_loss(global_model, device, val_loader)
+            feedback_ema_loss = (
+                V4_EMA_ALPHA * feedback_loss
+                + (1.0 - V4_EMA_ALPHA) * feedback_ema_loss
+            )
+            feedback_forgetting = np.maximum(
+                0.0, feedback_per_class - feedback_per_class
             )
 
         # ---- Update best state ----
@@ -1651,7 +2327,43 @@ def main():
         # ---- Round summary log ----
         round_log = {
             "run_id": run_id, "tag": args.tag, "round": r,
+            "stage_id": int(stage_position),
+            "block_id": int(block_id),
+            "domain_id": int(domain_id),
+            "control_mode": args.control_mode,
+            "evaluation_source": args.evaluation_source,
+            "source_stage0_checkpoint_sha256": source_checkpoint_sha256 or "",
             "global_acc": float(acc),
+            "feedback_val_acc": float(feedback_acc),
+            "feedback_val_loss": float(feedback_loss),
+            "feedback_forget_mean": float(np.mean(feedback_forgetting)),
+            "feedback_forget_max": float(np.max(feedback_forgetting)),
+            "optimizer_steps": int(round_optimizer_steps),
+            "current_example_presentations": int(round_current_presentations),
+            "replay_example_presentations": int(round_replay_presentations),
+            "total_example_presentations": int(
+                round_current_presentations + round_replay_presentations
+            ),
+            "memory_admissions": int(round_memory_admissions),
+            "replay_buffer_items": int(sum(len(c.replay.data) for c in clients)),
+            "controller_calls": int(controller_calls),
+            "controller_calls_cum": int(controller_calls_cum),
+            "controller_tokens": int(controller_tokens),
+            "controller_tokens_cum": int(controller_tokens_cum),
+            "controller_latency_seconds": float(controller_latency),
+            "controller_latency_seconds_cum": float(controller_latency_cum),
+            "controller_billed_cost": (
+                float(controller_cost) if billed_cost_value is not None else float("nan")
+            ),
+            "controller_billed_cost_cum": float(controller_cost_cum),
+            "controller_fallback": bool(
+                controller_metadata.get("fallback", False)
+            ),
+            "lmss_requested_model": controller_metadata.get(
+                "requested_model", ""
+            ),
+            "lmss_response_model": controller_metadata.get("response_model", ""),
+            "lmss_prompt_sha256": controller_metadata.get("prompt_sha256", ""),
 
             "lr": float(hp["lr"]),
             "replay_ratio": float(hp["replay_ratio"]),
@@ -1666,6 +2378,10 @@ def main():
 
             # stability / divergence
             "divergence": float(div_norm),
+            "mean_client_update_distance": float(mean_update_distance),
+            "relative_update_magnitude_dispersion": float(
+                relative_update_dispersion
+            ),
 
             # best seen and rollback flag
             "best_acc_so_far": float(best_global_acc),
@@ -1712,6 +2428,12 @@ def main():
                 ]["name"],
                 "current_domain_accuracy": domain_metrics["current_domain_accuracy"],
                 "seen_domain_accuracies": json.dumps(domain_metrics["seen_domain_accuracies"], sort_keys=True),
+                "mean_seen_domain_accuracy": domain_metrics["mean_seen_domain_accuracy"],
+                "round_averaged_seen_domain_accuracy": (
+                    seen_domain_u_sum / seen_domain_u_count
+                    if seen_domain_u_count
+                    else float("nan")
+                ),
                 "mean_previous_domain_accuracy": domain_metrics["mean_previous_domain_accuracy"],
                 "mean_previous_domain_retention": domain_metrics["mean_previous_domain_retention"],
             })
@@ -1743,6 +2465,39 @@ def main():
             if branching_mode
             else None
         )
+
+        if (
+            args.save_attribution_stage0
+            and r == args.blocks_per_stage - 1
+        ):
+            stage0_payload = {
+                "format_version": CHECKPOINT_FORMAT_VERSION,
+                "next_round": int(args.blocks_per_stage),
+                "parent_run_id": run_id,
+                "global_model": copy.deepcopy(global_model.state_dict()),
+                "clients": [
+                    {
+                        "cid": int(client.cid),
+                        "optimizer": copy.deepcopy(client.optimizer.state_dict()),
+                        "replay": client.replay.state_dict(),
+                        "persistent": client.persistent_state_dict(),
+                    }
+                    for client in clients
+                ],
+                "metrics": _metric_state(),
+                "rng": capture_rng_state(g),
+                "data_state": data_state,
+                "manifest": attribution_stage0_manifest,
+            }
+            stage0_metadata = save_checkpoint(
+                args.save_attribution_stage0, stage0_payload
+            )
+            print(
+                "[Attribution checkpoint] wrote shared stage-0 state "
+                f"{args.save_attribution_stage0} "
+                f"sha256={stage0_metadata['sha256']}",
+                flush=True,
+            )
 
         if args.capture_common_checkpoints and r in {1, 5}:
             reference_path = checkpoint_dir / f"parent_endpoint_round_{r:02d}.json"

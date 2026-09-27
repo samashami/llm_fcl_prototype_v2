@@ -37,6 +37,8 @@ class Client:
         self._no_improve = 0
         self.update_energy_rows = []
         self._optimizer_step = 0
+        self._last_current_presentations = 0
+        self._last_replay_presentations = 0
 
     def persistent_state_dict(self):
         """State outside the model/optimizer that persists across rounds."""
@@ -48,6 +50,8 @@ class Client:
             "_last_lr_scale",
             "_last_ewc_lambda",
             "_optimizer_step",
+            "_last_current_presentations",
+            "_last_replay_presentations",
         )
         return {
             name: deepcopy(getattr(self, name))
@@ -65,6 +69,8 @@ class Client:
             "_last_lr_scale",
             "_last_ewc_lambda",
             "_optimizer_step",
+            "_last_current_presentations",
+            "_last_replay_presentations",
         }
         unexpected = set(state) - allowed
         if unexpected:
@@ -106,24 +112,44 @@ class Client:
         update_control: str = "projection",
         shrinkage_factors=None,
         round_id: int = 0,
+        fixed_batch_budget: bool = False,
     ):
         self.model.train()
         num_batches = len(self.loader)
         running_loss = 0.0
         correct = 0
         total = 0
+        current_presentations = 0
+        replay_presentations = 0
 
         for b, (x, y) in enumerate(self.loader, 1):
             x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+            current_x = x
+            rx, ry = None, None
 
             # optional replay
             if self.replay is not None and replay_ratio > 0.0:
-                rx, ry = self.replay.sample_like(x.size(0), device=self.device, ratio=replay_ratio)
+                requested_replay = int(x.size(0) * replay_ratio)
+                rx, ry = self.replay.sample_count(requested_replay, device=self.device)
                 if rx is not None:
                     rx = rx.to(self.device, non_blocking=True)
                     ry = ry.to(self.device, non_blocking=True)
-                    x = torch.cat([x, rx], dim=0)
-                    y = torch.cat([y, ry], dim=0)
+                    if fixed_batch_budget:
+                        current_count = x.size(0) - rx.size(0)
+                        x = torch.cat([x[:current_count], rx], dim=0)
+                        y = torch.cat([y[:current_count], ry], dim=0)
+                    else:
+                        x = torch.cat([x, rx], dim=0)
+                        y = torch.cat([y, ry], dim=0)
+
+            replay_count = max(0, int(x.size(0) - current_x.size(0)))
+            if fixed_batch_budget:
+                replay_count = 0 if rx is None else int(rx.size(0))
+                current_count = int(x.size(0) - replay_count)
+            else:
+                current_count = int(current_x.size(0))
+            current_presentations += current_count
+            replay_presentations += replay_count
 
             self.optimizer.zero_grad(set_to_none=True)
             logits = self.model(x)
@@ -164,8 +190,7 @@ class Client:
                     shrinkage_layers if shrinkage_layers else None
                 )
             self.optimizer.step()
-            if projection_active or shrinkage_active or online_shrinkage_active:
-                self._optimizer_step += 1
+            self._optimizer_step += 1
             energy_records = []
             if projection_active and protected_weights:
                 energy_records = self.gradient_monitor.soft_project_parameter_updates(
@@ -203,7 +228,7 @@ class Client:
                 total += batch_total
 
             # store CPU copies for replay
-            if self.replay is not None:
+            if self.replay is not None and not fixed_batch_budget:
                 self.replay.add_batch(x.detach().cpu(), y.detach().cpu())
 
             # periodic log
@@ -238,4 +263,6 @@ class Client:
         )
 
         should_stop = (self.val_loader is not None) and (self._no_improve >= self.early_patience)
+        self._last_current_presentations = int(current_presentations)
+        self._last_replay_presentations = int(replay_presentations)
         return avg_loss, epoch_acc, should_stop

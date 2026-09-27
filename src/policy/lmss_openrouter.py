@@ -1,5 +1,7 @@
 import json
+import hashlib
 import os
+import time
 from typing import Any, Dict
 
 from openai import OpenAI
@@ -40,6 +42,7 @@ def lmss_decide_action_openrouter(
     state: Dict[str, Any],
     compact_state_fn,
     model: str = _DEFAULT_MODEL,
+    deterministic: bool = False,
 ) -> Dict[str, Any]:
     n_clients = len(state.get("clients", []))
     if n_clients <= 0:
@@ -48,6 +51,19 @@ def lmss_decide_action_openrouter(
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         action = _build_action_from_strategy(1, n_clients, "LMSS_OPENROUTER_NO_KEY_FALLBACK")
+        action["controller_metadata"] = {
+            "call_count": 0,
+            "fallback": True,
+            "latency_seconds": 0.0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "billed_cost": None,
+            "requested_model": model,
+            "response_model": None,
+            "temperature": 0.0 if deterministic else None,
+            "top_p": 1.0 if deterministic else None,
+        }
         print(
             "[LMSS_OPENROUTER] policy_source=LMSS_OPENROUTER_NO_KEY_FALLBACK "
             "raw_response=<missing OPENROUTER_API_KEY> strategy_id=1 "
@@ -56,10 +72,13 @@ def lmss_decide_action_openrouter(
         )
         return action
 
-    client = OpenAI(
+    client_kwargs = dict(
         api_key=api_key,
         base_url=os.environ.get("OPENROUTER_BASE_URL", _DEFAULT_BASE_URL),
     )
+    if deterministic:
+        client_kwargs.update(max_retries=0, timeout=60.0)
+    client = OpenAI(**client_kwargs)
 
     s_small = compact_state_fn(state)
     palette_text = "\n".join(
@@ -82,6 +101,7 @@ Return ONLY one JSON object in this exact format:
 
 No extra text.
 """
+    prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
     extra_headers = {}
     referer = os.environ.get("OPENROUTER_HTTP_REFERER")
@@ -92,21 +112,47 @@ No extra text.
         extra_headers["X-Title"] = title
 
     raw_content = ""
+    started = time.perf_counter()
     try:
-        resp = client.chat.completions.create(
+        request_kwargs = dict(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             extra_headers=extra_headers or None,
         )
+        if deterministic:
+            request_kwargs.update(temperature=0.0, top_p=1.0)
+        resp = client.chat.completions.create(**request_kwargs)
+        latency_seconds = time.perf_counter() - started
         raw_content = resp.choices[0].message.content or ""
         parsed = json.loads(raw_content)
-        strategy_id = int(parsed.get("strategy_id", 1))
+        if "strategy_id" not in parsed:
+            raise ValueError("LMSS response is missing strategy_id")
+        strategy_id = int(parsed["strategy_id"])
+        if strategy_id not in STRATEGY_PALETTE:
+            raise ValueError(f"LMSS returned unsupported strategy_id={strategy_id}")
         action = _build_action_from_strategy(
             strategy_id,
             n_clients,
             f"LMSS_OPENROUTER_{model}_STRAT_{strategy_id}",
         )
+        usage = getattr(resp, "usage", None)
+        action["strategy_id"] = strategy_id
+        action["reasoning"] = str(parsed.get("reasoning", ""))
+        action["controller_metadata"] = {
+            "call_count": 1,
+            "fallback": False,
+            "latency_seconds": float(latency_seconds),
+            "prompt_tokens": int(getattr(usage, "prompt_tokens", 0) or 0),
+            "completion_tokens": int(getattr(usage, "completion_tokens", 0) or 0),
+            "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
+            "billed_cost": getattr(usage, "cost", None),
+            "requested_model": model,
+            "response_model": getattr(resp, "model", None),
+            "temperature": 0.0 if deterministic else None,
+            "top_p": 1.0 if deterministic else None,
+            "prompt_sha256": prompt_sha256,
+        }
         print(
             f"[LMSS_OPENROUTER] policy_source={action['policy_source']} "
             f"raw_response={raw_content} strategy_id={strategy_id} "
@@ -115,7 +161,23 @@ No extra text.
         )
         return action
     except Exception as e:
+        latency_seconds = time.perf_counter() - started
         action = _build_action_from_strategy(1, n_clients, "LMSS_OPENROUTER_ERROR_FALLBACK")
+        action["controller_metadata"] = {
+            "call_count": 1,
+            "fallback": True,
+            "latency_seconds": float(latency_seconds),
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "billed_cost": None,
+            "requested_model": model,
+            "response_model": None,
+            "temperature": 0.0 if deterministic else None,
+            "top_p": 1.0 if deterministic else None,
+            "prompt_sha256": prompt_sha256,
+            "error": repr(e),
+        }
         print(
             f"[LMSS_OPENROUTER] policy_source=LMSS_OPENROUTER_ERROR_FALLBACK "
             f"raw_response={raw_content or repr(e)} strategy_id=1 "
