@@ -1,7 +1,9 @@
 # Feedback-attribution study protocol
 
-This protocol implements the preregistered internal pilot only. External
-FedQCL-DPP and BI adaptations begin only after the pilot gate passes.
+This file defines the preregistered feedback-attribution pilot. FedQCL-DPP's
+code adaptation and smoke qualification are specified separately in
+`FEDQCL_DPP_ADAPTATION.md`; its full comparator run remains downstream of the
+pilot decision gate. BI adaptation is not part of this branch's implementation.
 
 ## Frozen design
 

@@ -113,6 +113,10 @@ class Client:
         shrinkage_factors=None,
         round_id: int = 0,
         fixed_batch_budget: bool = False,
+        fedqcl_memory=None,
+        fedqcl_queues=None,
+        fedqcl_reference_losses=None,
+        fedqcl_v: float = 1.0,
     ):
         self.model.train()
         num_batches = len(self.loader)
@@ -121,14 +125,24 @@ class Client:
         total = 0
         current_presentations = 0
         replay_presentations = 0
+        fedqcl_penalty_sum = 0.0
+        fedqcl_steps = 0
+        fedqcl_active = fedqcl_memory is not None
 
         for b, (x, y) in enumerate(self.loader, 1):
             x, y = x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
             current_x = x
             rx, ry = None, None
 
-            # optional replay
-            if self.replay is not None and replay_ratio > 0.0:
+            grouped_replay = {}
+            # FedQCL samples task/domain-labelled memory. Other controllers keep
+            # using the original undifferentiated replay path unchanged.
+            if fedqcl_active and replay_ratio > 0.0:
+                requested_replay = int(x.size(0) * replay_ratio)
+                grouped_replay = fedqcl_memory.sample_by_group(
+                    requested_replay, device=self.device
+                )
+            elif self.replay is not None and replay_ratio > 0.0:
                 requested_replay = int(x.size(0) * replay_ratio)
                 rx, ry = self.replay.sample_count(requested_replay, device=self.device)
                 if rx is not None:
@@ -142,18 +156,47 @@ class Client:
                         x = torch.cat([x, rx], dim=0)
                         y = torch.cat([y, ry], dim=0)
 
-            replay_count = max(0, int(x.size(0) - current_x.size(0)))
-            if fixed_batch_budget:
+            if fedqcl_active:
+                replay_count = sum(int(batch[1].numel()) for batch in grouped_replay.values())
+                current_count = int(current_x.size(0) - replay_count)
+                x = current_x[:current_count]
+                y = y[:current_count]
+            else:
+                replay_count = max(0, int(x.size(0) - current_x.size(0)))
+            if fixed_batch_budget and not fedqcl_active:
                 replay_count = 0 if rx is None else int(rx.size(0))
                 current_count = int(x.size(0) - replay_count)
             else:
-                current_count = int(current_x.size(0))
+                if not fedqcl_active:
+                    current_count = int(current_x.size(0))
             current_presentations += current_count
             replay_presentations += replay_count
 
             self.optimizer.zero_grad(set_to_none=True)
-            logits = self.model(x)
-            loss = self.criterion(logits, y)
+            if fedqcl_active:
+                from src.policy.fedqcl_dpp import fedqcl_objective
+
+                logits = self.model(x)
+                current_loss = self.criterion(logits, y)
+                replay_losses = {}
+                for group_id, (mem_x, mem_y) in grouped_replay.items():
+                    replay_losses[int(group_id)] = self.criterion(
+                        self.model(mem_x), mem_y
+                    )
+                loss = fedqcl_objective(
+                    current_loss,
+                    replay_losses,
+                    fedqcl_queues or {},
+                    fedqcl_reference_losses or {},
+                    penalty_weight=fedqcl_v,
+                )
+                fedqcl_penalty_sum += float(
+                    (loss - float(fedqcl_v) * current_loss).detach().item()
+                )
+                fedqcl_steps += 1
+            else:
+                logits = self.model(x)
+                loss = self.criterion(logits, y)
             loss.backward()
             if self.gradient_monitor is not None:
                 self.gradient_monitor.measure_gradients()
@@ -265,4 +308,7 @@ class Client:
         should_stop = (self.val_loader is not None) and (self._no_improve >= self.early_patience)
         self._last_current_presentations = int(current_presentations)
         self._last_replay_presentations = int(replay_presentations)
+        self._last_fedqcl_penalty_loss = (
+            fedqcl_penalty_sum / max(1, fedqcl_steps) if fedqcl_active else 0.0
+        )
         return avg_loss, epoch_acc, should_stop

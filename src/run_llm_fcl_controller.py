@@ -16,6 +16,11 @@ from src.strategies.replay import ReplayBuffer
 from src.policy import Policy
 from src.policy.lmss_api import lmss_decide_action_api
 from src.policy.lmss_openrouter import STRATEGY_PALETTE, lmss_decide_action_openrouter
+from src.policy.fedqcl_dpp import (
+    FedQCLMemory,
+    FedQCLState,
+    evaluate_group_losses,
+)
 from src.agent_io import save_json
 from src.agent_io import write_state_json, write_action_json, validate_action
 from src.mock_agent import decide_action as mock_decide_action
@@ -486,12 +491,21 @@ def main():
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--optimizer", choices=["adam","sgd"], default="adam")
     ap.add_argument("--early_patience", type=int, default=5)
+    ap.add_argument(
+        "--fedqcl_v", type=float, default=200.0,
+        help="FedQCL current-task penalty weight (frozen CIFAR-100 reference value)",
+    )
+    ap.add_argument(
+        "--fedqcl_delta", type=float, default=1.0,
+        help="FedQCL tolerated per-domain replay-loss increase",
+    )
     ap.add_argument("--tag", type=str, default="controller_v4")
     ap.add_argument(
         "--controller",
         choices=[
             "v4", "rules_joint", "mock", "fixed", "frozen_lmss", "sft", "lmss_api",
             "lmss_local", "lmss_openrouter",
+            "fedqcl_dpp",
         ],
         default="v4",
     )
@@ -576,6 +590,21 @@ def main():
     ap.add_argument("--output_dir", type=str, default=".")
     args = ap.parse_args()
 
+    if args.fedqcl_v <= 0 or args.fedqcl_delta < 0:
+        ap.error("--fedqcl_v must be positive and --fedqcl_delta nonnegative")
+    if args.controller == "fedqcl_dpp":
+        if not args.attribution_protocol:
+            ap.error("--controller fedqcl_dpp requires --attribution_protocol")
+        if args.control_mode != "joint":
+            ap.error("FedQCL-DPP requires --control_mode joint")
+        if (
+            args.save_attribution_stage0
+            or args.resume_attribution_stage0
+            or args.capture_common_checkpoints
+            or args.resume_checkpoint
+        ):
+            ap.error("FedQCL-DPP does not support the current checkpoint/resume paths")
+
     if args.attribution_protocol:
         if args.stream_mode != "controlled_domain_shift":
             ap.error("--attribution_protocol requires --stream_mode controlled_domain_shift")
@@ -590,12 +619,13 @@ def main():
         if args.epochs < args.blocks_per_stage:
             ap.error("--epochs must allow at least one epoch per control block")
         allowed_controllers = {
-            "fixed", "frozen_lmss", "lmss_openrouter", "rules_joint"
+            "fixed", "frozen_lmss", "lmss_openrouter", "rules_joint",
+            "fedqcl_dpp",
         }
         if args.controller not in allowed_controllers:
             ap.error(
                 "--attribution_protocol supports only fixed, frozen_lmss, "
-                "lmss_openrouter, and rules_joint"
+                "lmss_openrouter, rules_joint, and fedqcl_dpp"
             )
         if args.controller != "lmss_openrouter" and args.control_mode != "joint":
             ap.error(
@@ -784,6 +814,7 @@ def main():
         "lmss_api": "LMSS_API",
         "lmss_local": "LMSS_LOCAL",
         "lmss_openrouter": "LMSS_OPENROUTER",
+        "fedqcl_dpp": "FedQCL_DPP_Adapted",
     }
 
     controller_name = controller_name_map.get(args.controller, args.controller)
@@ -813,6 +844,7 @@ def main():
         "blocks_per_stage", "domain_order",
         "evaluation_source",
         "control_mode", "num_workers", "optimizer", "early_patience", "controller",
+        "fedqcl_v", "fedqcl_delta",
         "lmss_model", "frozen_action_schedule",
         "measure_subspaces", "subspace_energy", "subspace_max_rank",
         "subspace_samples_per_batch", "subspace_samples_per_phase",
@@ -845,6 +877,7 @@ def main():
         "src/data_il_streams.py",
         "src/attribution_protocol.py",
         "src/policy/lmss_openrouter.py",
+        "src/policy/fedqcl_dpp.py",
         "src/instrumentation/subspace.py",
     )
     attribution_common_protocol = {
@@ -1196,8 +1229,14 @@ def main():
             capacity=2000,
             seed=(args.seed * 1000 + cid) if args.attribution_protocol else None,
         )
-        clients.append(Client(cid, model, opt, loader, device=device, replay=replay,
-                              val_loader=val_loader, early_patience=args.early_patience))
+        client = Client(cid, model, opt, loader, device=device, replay=replay,
+                        val_loader=val_loader, early_patience=args.early_patience)
+        if args.controller == "fedqcl_dpp":
+            client.fedqcl_memory = FedQCLMemory(
+                capacity=2000, seed=args.seed * 1000 + cid + 73
+            )
+            client.fedqcl_state = FedQCLState()
+        clients.append(client)
 
         if cid == 0:
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1368,6 +1407,19 @@ def main():
             },
             "frozen_schedule_sha256": frozen_schedule_sha256,
         }
+        if args.controller == "fedqcl_dpp":
+            run_protocol["fedqcl_dpp_adaptation"] = {
+                "name": "FedQCL-DPP adapted to shared-head Data-IL",
+                "objective": "V*CE(current)+sum_k Q_k*(CE(replay_k)-CE(stage_reference_k))",
+                "queue_update_timing": "each communication round, pre-FedAvg",
+                "reference_timing": "fixed global model at stage start",
+                "queue_scope": "client x historical domain",
+                "memory_capacity_per_client": 2000,
+                "memory_sampling": "domain-stratified bounded memory",
+                "V": float(args.fedqcl_v),
+                "delta": float(args.fedqcl_delta),
+                "source_code_update_timing": "task-boundary; differs from this adaptation",
+            }
         Path(io_root, "run_protocol.json").write_text(
             json.dumps(run_protocol, indent=2, sort_keys=True),
             encoding="utf-8",
@@ -1685,6 +1737,29 @@ def main():
         # ---- Broadcast global model to all clients (FedAvg step 1) ----
         for c in clients:
             c.model.load_state_dict(global_model.state_dict())
+
+        fedqcl_round_diagnostics = {}
+        if args.controller == "fedqcl_dpp":
+            stage_reference_sha = model_state_sha256(global_model.state_dict())
+            for c in clients:
+                if c.fedqcl_state.reference_stage != stage_position:
+                    reference_losses = evaluate_group_losses(
+                        global_model, c.fedqcl_memory, device
+                    )
+                    c.fedqcl_state.begin_stage(
+                        stage_position, reference_losses, stage_reference_sha
+                    )
+                fedqcl_round_diagnostics[int(c.cid)] = {
+                    "reference_stage": int(c.fedqcl_state.reference_stage),
+                    "reference_model_sha256": c.fedqcl_state.reference_model_sha256,
+                    "reference_losses": dict(c.fedqcl_state.reference_losses),
+                    "queue_before": dict(c.fedqcl_state.queues),
+                    "queue_after": dict(c.fedqcl_state.queues),
+                    "losses_after_local_training": {},
+                    "updates": {},
+                    "queue_weighted_penalty_loss": 0.0,
+                    "penalty_epochs": 0,
+                }
         
         acc_delta = float(feedback_acc - feedback_last_acc)
 
@@ -1709,7 +1784,13 @@ def main():
                 "vloss": float(getattr(c, "_last_vloss", float("nan"))),
                 "vacc": client_vacc,
                 "new_batch_size": int(nb),
-                "replay_capacity": int(getattr(getattr(c, "replay", None), "capacity", 2000)),
+                "replay_capacity": int(
+                    getattr(
+                        getattr(c, "fedqcl_memory", getattr(c, "replay", None)),
+                        "capacity",
+                        2000,
+                    )
+                ),
                 "last_lr": _lr_snapshot,
                 "last_replay_ratio": float(last_hp.get("replay_ratio", 0.50)),
                 "last_ewc_lambda": float(getattr(c, "_last_ewc_lambda", 0.0)),
@@ -1735,6 +1816,21 @@ def main():
         }
         if args.attribution_protocol:
             state["accuracy_unit"] = "fraction"
+        if args.controller == "fedqcl_dpp":
+            state["fedqcl_dpp"] = {
+                "adaptation": "shared-head Data-IL; per-client/per-domain queues",
+                "penalty_weight_v": float(args.fedqcl_v),
+                "tolerance_delta": float(args.fedqcl_delta),
+                "clients": {
+                    str(cid): {
+                        "reference_stage": row["reference_stage"],
+                        "reference_model_sha256": row["reference_model_sha256"],
+                        "reference_losses": row["reference_losses"],
+                        "queues_before": row["queue_before"],
+                    }
+                    for cid, row in fedqcl_round_diagnostics.items()
+                },
+            }
         write_state_json(io_root, r, state)
 
         # =========================================================
@@ -1763,6 +1859,30 @@ def main():
             hp_lr = float(args.lr)
             rep = 0.50
             hp_notes = "attribution protocol: fixed stage 0"
+
+        elif args.controller == "fedqcl_dpp":
+            candidate = {
+                "lr": float(args.lr),
+                "client_selection_k": len(clients),
+                "aggregation": {"method": "FedAvg"},
+                "client_params": [
+                    {
+                        "id": int(c.cid),
+                        "replay_ratio": 0.50,
+                        "lr_scale": 1.0,
+                        "ewc_lambda": 0.0,
+                    }
+                    for c in clients
+                ],
+            }
+            action = validate_action(
+                candidate,
+                n_clients=len(clients),
+                policy_source="FedQCL_DPP_Adapted",
+            )
+            hp_lr = float(args.lr)
+            rep = 0.50
+            hp_notes = "FedQCL-DPP adapted: fixed LR/replay, queue-weighted memory objective"
 
         elif args.controller == "sft":
             # SFT: the tiny local LM returns JSON; we validate & clamp it.
@@ -2097,9 +2217,30 @@ def main():
                     ),
                     round_id=r,
                     fixed_batch_budget=args.attribution_protocol,
+                    fedqcl_memory=(
+                        c.fedqcl_memory
+                        if args.controller == "fedqcl_dpp"
+                        else None
+                    ),
+                    fedqcl_queues=(
+                        c.fedqcl_state.queues
+                        if args.controller == "fedqcl_dpp"
+                        else None
+                    ),
+                    fedqcl_reference_losses=(
+                        c.fedqcl_state.reference_losses
+                        if args.controller == "fedqcl_dpp"
+                        else None
+                    ),
+                    fedqcl_v=args.fedqcl_v,
                 )
                 round_current_presentations += c._last_current_presentations
                 round_replay_presentations += c._last_replay_presentations
+                if args.controller == "fedqcl_dpp":
+                    fedqcl_round_diagnostics[int(c.cid)][
+                        "queue_weighted_penalty_loss"
+                    ] += float(c._last_fedqcl_penalty_loss)
+                    fedqcl_round_diagnostics[int(c.cid)]["penalty_epochs"] += 1
                 run_logs.append({
                     "run_id": run_id, "tag": args.tag, "round": r, "client": c.cid,
                     "epoch": e + 1,
@@ -2124,6 +2265,21 @@ def main():
                     print(f"[Client {c.cid}] Early stopping (patience {c.early_patience})", flush=True)
                     break
 
+            if args.controller == "fedqcl_dpp":
+                post_losses = evaluate_group_losses(
+                    c.model, c.fedqcl_memory, device
+                )
+                queue_updates = c.fedqcl_state.update(
+                    post_losses, args.fedqcl_delta
+                )
+                fedqcl_round_diagnostics[int(c.cid)][
+                    "losses_after_local_training"
+                ] = post_losses
+                fedqcl_round_diagnostics[int(c.cid)]["updates"] = queue_updates
+                fedqcl_round_diagnostics[int(c.cid)]["queue_after"] = dict(
+                    c.fedqcl_state.queues
+                )
+
             if args.attribution_protocol and block_id == args.blocks_per_stage - 1:
                 memory_dataset = StageDomainDataset(
                     trainset_full,
@@ -2140,7 +2296,12 @@ def main():
                     pin_memory=True,
                 )
                 for memory_x, memory_y in memory_loader:
-                    c.replay.add_batch(memory_x, memory_y)
+                    if args.controller == "fedqcl_dpp":
+                        c.fedqcl_memory.add_domain_batch(
+                            domain_id, memory_x, memory_y
+                        )
+                    else:
+                        c.replay.add_batch(memory_x, memory_y)
                     round_memory_admissions += int(memory_y.numel())
 
         round_optimizer_steps = (
@@ -2345,7 +2506,14 @@ def main():
                 round_current_presentations + round_replay_presentations
             ),
             "memory_admissions": int(round_memory_admissions),
-            "replay_buffer_items": int(sum(len(c.replay.data) for c in clients)),
+            "replay_buffer_items": int(
+                sum(
+                    len(c.fedqcl_memory)
+                    if args.controller == "fedqcl_dpp"
+                    else len(c.replay.data)
+                    for c in clients
+                )
+            ),
             "controller_calls": int(controller_calls),
             "controller_calls_cum": int(controller_calls_cum),
             "controller_tokens": int(controller_tokens),
@@ -2436,6 +2604,59 @@ def main():
                 ),
                 "mean_previous_domain_accuracy": domain_metrics["mean_previous_domain_accuracy"],
                 "mean_previous_domain_retention": domain_metrics["mean_previous_domain_retention"],
+            })
+        if args.controller == "fedqcl_dpp":
+            queue_before_values = [
+                float(q)
+                for row in fedqcl_round_diagnostics.values()
+                for q in row["queue_before"].values()
+            ]
+            queue_after_values = [
+                float(q)
+                for row in fedqcl_round_diagnostics.values()
+                for q in row["queue_after"].values()
+            ]
+            round_log.update({
+                "fedqcl_adaptation": "shared_head_data_il",
+                "fedqcl_v": float(args.fedqcl_v),
+                "fedqcl_delta": float(args.fedqcl_delta),
+                "fedqcl_reference_stage": int(stage_position),
+                "fedqcl_reference_model_sha256": stage_reference_sha,
+                "fedqcl_reference_losses_by_client": json.dumps(
+                    {str(cid): row["reference_losses"]
+                     for cid, row in fedqcl_round_diagnostics.items()},
+                    sort_keys=True,
+                ),
+                "fedqcl_losses_after_local_by_client": json.dumps(
+                    {str(cid): row["losses_after_local_training"]
+                     for cid, row in fedqcl_round_diagnostics.items()},
+                    sort_keys=True,
+                ),
+                "fedqcl_queue_updates_by_client": json.dumps(
+                    {str(cid): row["updates"]
+                     for cid, row in fedqcl_round_diagnostics.items()},
+                    sort_keys=True,
+                ),
+                "fedqcl_mean_queue_before": (
+                    float(np.mean(queue_before_values)) if queue_before_values else 0.0
+                ),
+                "fedqcl_mean_queue_after": (
+                    float(np.mean(queue_after_values)) if queue_after_values else 0.0
+                ),
+                "fedqcl_max_queue_after": (
+                    float(np.max(queue_after_values)) if queue_after_values else 0.0
+                ),
+                "fedqcl_queue_weighted_penalty_loss": float(
+                    np.mean([
+                        row["queue_weighted_penalty_loss"]
+                        / max(1, row["penalty_epochs"])
+                        for row in fedqcl_round_diagnostics.values()
+                    ])
+                ),
+                "fedqcl_memory_items_per_client": json.dumps(
+                    {str(c.cid): len(c.fedqcl_memory) for c in clients},
+                    sort_keys=True,
+                ),
             })
         round_logs.append(round_log)
         
