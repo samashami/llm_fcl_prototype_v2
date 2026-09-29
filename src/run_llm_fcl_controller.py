@@ -670,12 +670,14 @@ def main():
                 f"{config_mismatches}"
             )
         if args.attribution_smoke and (
-            args.controller != "fixed"
+            args.controller not in {"fixed", "fedqcl_dpp"}
             or args.control_mode != "joint"
             or args.domain_order != "development"
             or args.evaluation_source != "validation"
         ):
-            ap.error("--attribution_smoke is only the documented fixed development run")
+            ap.error(
+                "--attribution_smoke supports fixed or FedQCL-DPP development runs"
+            )
         if args.domain_order == "development" and args.evaluation_source != "validation":
             ap.error(
                 "development attribution runs require --evaluation_source validation"
