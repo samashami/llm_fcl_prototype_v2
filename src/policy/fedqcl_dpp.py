@@ -160,6 +160,20 @@ class FedQCLMemory:
             largest = max(self._groups, key=lambda k: len(self._groups[k]))
             self._groups[largest].pop(self._rng.randrange(len(self._groups[largest])))
 
+def add_domain_batches(memory: FedQCLMemory, group_id: int, batches) -> int:
+    """Admit all minibatches for one domain as a single memory group."""
+    xs, ys = [], []
+    for x, y in batches:
+        xs.append(x)
+        ys.append(y)
+    if not xs:
+        raise ValueError(f"FedQCL domain {int(group_id)} has no memory examples")
+    all_x = torch.cat(xs, dim=0)
+    all_y = torch.cat(ys, dim=0)
+    memory.add_domain_batch(group_id, all_x, all_y)
+    return int(all_y.numel())
+
+
     def sample_by_group(self, count: int, device) -> Dict[int, Tuple[torch.Tensor, torch.Tensor]]:
         groups = [gid for gid in self.group_ids if self._groups[gid]]
         count = min(max(0, int(count)), len(self))
