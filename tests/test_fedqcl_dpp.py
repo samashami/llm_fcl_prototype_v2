@@ -8,6 +8,7 @@ from src.fl import Client
 from src.policy.fedqcl_dpp import (
     FedQCLMemory,
     FedQCLState,
+    add_domain_batches,
     fedqcl_objective,
     update_queue,
 )
@@ -99,6 +100,22 @@ class FedQCLQueueTests(unittest.TestCase):
             torch.equal(base.weight.detach(), treated.weight.detach())
         )
         self.assertGreater(abs(treated_client._last_fedqcl_penalty_loss), 0.0)
+
+    def test_domain_loader_batches_are_admitted_once_as_one_group(self):
+        memory = FedQCLMemory(capacity=100, seed=7)
+        x = torch.arange(65, dtype=torch.float32).view(-1, 1)
+        y = torch.arange(65, dtype=torch.long) % 5
+        loader = DataLoader(TensorDataset(x, y), batch_size=32, shuffle=False)
+
+        admitted = add_domain_batches(memory, 3, loader)
+
+        self.assertEqual(admitted, 65)
+        self.assertEqual(len(memory), 65)
+        self.assertEqual(memory.group_ids, (3,))
+        sampled = memory.sample_by_group(65, "cpu")
+        self.assertEqual(sampled[3][0].shape[0], 65)
+        self.assertTrue(torch.equal(torch.sort(sampled[3][0].view(-1)).values, x.view(-1)))
+
 
     def test_domain_memory_is_bounded_and_samples_keep_domain_identity(self):
         memory = FedQCLMemory(capacity=6, seed=12)
