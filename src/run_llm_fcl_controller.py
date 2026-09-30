@@ -19,6 +19,7 @@ from src.policy.lmss_openrouter import STRATEGY_PALETTE, lmss_decide_action_open
 from src.policy.fedqcl_dpp import (
     FedQCLMemory,
     FedQCLState,
+    add_domain_batches,
     evaluate_group_losses,
 )
 from src.agent_io import save_json
@@ -2297,14 +2298,14 @@ def main():
                     num_workers=args.num_workers,
                     pin_memory=True,
                 )
-                for memory_x, memory_y in memory_loader:
-                    if args.controller == "fedqcl_dpp":
-                        c.fedqcl_memory.add_domain_batch(
-                            domain_id, memory_x, memory_y
-                        )
-                    else:
+                if args.controller == "fedqcl_dpp":
+                    round_memory_admissions += add_domain_batches(
+                        c.fedqcl_memory, domain_id, memory_loader
+                    )
+                else:
+                    for memory_x, memory_y in memory_loader:
                         c.replay.add_batch(memory_x, memory_y)
-                    round_memory_admissions += int(memory_y.numel())
+                        round_memory_admissions += int(memory_y.numel())
 
         round_optimizer_steps = (
             sum(c._optimizer_step for c in clients) - round_optimizer_steps_before
