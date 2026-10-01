@@ -669,6 +669,8 @@ def main():
             )
     elif args.blocks_per_stage != 1:
         ap.error("--blocks_per_stage other than 1 requires --attribution_protocol")
+    if args.controller == "bi_memory" and not args.attribution_protocol:
+        ap.error("--controller bi_memory requires --attribution_protocol")
     if args.attribution_smoke and not args.attribution_protocol:
         ap.error("--attribution_smoke requires --attribution_protocol")
     if args.controller == "frozen_lmss" and not args.frozen_action_schedule:
@@ -2402,6 +2404,10 @@ def main():
             "bi_samples_offered_once": int(round_bi_samples_offered),
             "bi_memory_stage_ids_by_client": json.dumps(
                 {str(c.cid): list(getattr(c.replay, "stage_ids", ())) for c in clients},
+                sort_keys=True,
+            ),
+            "bi_memory_class_counts_by_client": json.dumps(
+                {str(c.cid): getattr(c.replay, "class_counts", {}) for c in clients},
                 sort_keys=True,
             ),
             "replay_buffer_items": int(sum(len(c.replay.data) for c in clients)),
