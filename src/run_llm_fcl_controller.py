@@ -13,6 +13,7 @@ from pathlib import Path
 from src.model import build_resnet18
 from src.fl import Client, Server
 from src.strategies.replay import ReplayBuffer
+from src.policy.bi_memory import BIMemory
 from src.policy import Policy
 from src.policy.lmss_api import lmss_decide_action_api
 from src.policy.lmss_openrouter import STRATEGY_PALETTE, lmss_decide_action_openrouter
@@ -491,10 +492,12 @@ def main():
         "--controller",
         choices=[
             "v4", "rules_joint", "mock", "fixed", "frozen_lmss", "sft", "lmss_api",
-            "lmss_local", "lmss_openrouter",
+            "lmss_local", "lmss_openrouter", "bi_memory",
         ],
         default="v4",
     )
+    ap.add_argument("--bi_memory_capacity", type=int, default=2000)
+    ap.add_argument("--bi_score_batch_size", type=int, default=128)
     ap.add_argument("--lmss_model", type=str, default=None)
     ap.add_argument("--frozen_action_schedule", type=str, default=None)
     ap.add_argument("--save_attribution_stage0", type=str, default=None)
@@ -590,11 +593,11 @@ def main():
         if args.epochs < args.blocks_per_stage:
             ap.error("--epochs must allow at least one epoch per control block")
         allowed_controllers = {
-            "fixed", "frozen_lmss", "lmss_openrouter", "rules_joint"
+            "fixed", "frozen_lmss", "lmss_openrouter", "rules_joint", "bi_memory"
         }
         if args.controller not in allowed_controllers:
             ap.error(
-                "--attribution_protocol supports only fixed, frozen_lmss, "
+                "--attribution_protocol supports fixed, bi_memory, frozen_lmss, "
                 "lmss_openrouter, and rules_joint"
             )
         if args.controller != "lmss_openrouter" and args.control_mode != "joint":
@@ -640,12 +643,20 @@ def main():
                 f"{config_mismatches}"
             )
         if args.attribution_smoke and (
-            args.controller != "fixed"
+            args.controller not in {"fixed", "bi_memory"}
             or args.control_mode != "joint"
             or args.domain_order != "development"
             or args.evaluation_source != "validation"
         ):
-            ap.error("--attribution_smoke is only the documented fixed development run")
+            ap.error("--attribution_smoke requires fixed or BI, joint control, and the development validation order")
+        if args.controller == "bi_memory":
+            expected_bi_capacity = 64 if args.attribution_smoke else 2000
+            if args.bi_memory_capacity != expected_bi_capacity:
+                ap.error(f"BI memory capacity must be {expected_bi_capacity} for this run")
+            if args.bi_score_batch_size != 128:
+                ap.error("BI score batch size is fixed at 128")
+        elif args.bi_memory_capacity != 2000 or args.bi_score_batch_size != 128:
+            ap.error("BI memory settings are only configurable for --controller bi_memory")
         if args.domain_order == "development" and args.evaluation_source != "validation":
             ap.error(
                 "development attribution runs require --evaluation_source validation"
@@ -784,6 +795,7 @@ def main():
         "lmss_api": "LMSS_API",
         "lmss_local": "LMSS_LOCAL",
         "lmss_openrouter": "LMSS_OPENROUTER",
+        "bi_memory": "BI_MEMORY_ADAPTED",
     }
 
     controller_name = controller_name_map.get(args.controller, args.controller)
@@ -1192,9 +1204,15 @@ def main():
             opt = optim.Adam(model.parameters(), lr=args.lr, weight_decay=0.0)
         else:
             opt = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
-        replay = ReplayBuffer(
-            capacity=2000,
-            seed=(args.seed * 1000 + cid) if args.attribution_protocol else None,
+        replay_seed = (args.seed * 1000 + cid) if args.attribution_protocol else None
+        replay = (
+            BIMemory(
+                capacity=args.bi_memory_capacity,
+                seed=replay_seed,
+                score_batch_size=args.bi_score_batch_size,
+            )
+            if args.controller == "bi_memory"
+            else ReplayBuffer(capacity=2000, seed=replay_seed)
         )
         clients.append(Client(cid, model, opt, loader, device=device, replay=replay,
                               val_loader=val_loader, early_patience=args.early_patience))
@@ -1938,8 +1956,8 @@ def main():
             hp_lr = float(lr)
             hp_notes = " | ".join(notes)
             
-        elif args.controller == "fixed":
-            # fixed (paper CL defaults)
+        elif args.controller in {"fixed", "bi_memory"}:
+            # BI changes memory admission only; optimizer and policy stay Fixed.
             candidate = {
                 "client_selection_k": len(clients),
                 "aggregation": {"method": "FedAvg"},
@@ -1948,10 +1966,18 @@ def main():
                     for c in clients
                 ],
             }
-            action = validate_action(candidate, n_clients=len(clients), policy_source="Fixed")
+            action = validate_action(
+                candidate,
+                n_clients=len(clients),
+                policy_source="BI memory with fixed training policy"
+                if args.controller == "bi_memory" else "Fixed",
+            )
             hp_lr = float(args.lr)
             rep = 0.50
-            hp_notes = "fixed (paper CL default)"
+            hp_notes = (
+                "BI-adapted class-balanced memory; fixed training policy"
+                if args.controller == "bi_memory" else "fixed (paper CL default)"
+            )
         elif args.controller == "frozen_lmss":
             raw = copy.deepcopy(frozen_actions[r])
             raw.pop("controller_metadata", None)
@@ -2041,6 +2067,9 @@ def main():
         round_replay_presentations = 0
         round_optimizer_steps_before = sum(c._optimizer_step for c in clients)
         round_memory_admissions = 0
+        round_bi_scoring_seconds = 0.0
+        round_bi_scored_candidates = 0
+        round_bi_samples_offered = 0
 
         for c in clients:
             batches = cl_schedule[c.cid]
@@ -2097,6 +2126,7 @@ def main():
                     ),
                     round_id=r,
                     fixed_batch_budget=args.attribution_protocol,
+                    active_stage_id=(domain_id if args.controller == "bi_memory" else None),
                 )
                 round_current_presentations += c._last_current_presentations
                 round_replay_presentations += c._last_replay_presentations
@@ -2139,9 +2169,31 @@ def main():
                     num_workers=args.num_workers,
                     pin_memory=True,
                 )
-                for memory_x, memory_y in memory_loader:
-                    c.replay.add_batch(memory_x, memory_y)
-                    round_memory_admissions += int(memory_y.numel())
+                if args.controller == "bi_memory":
+                    memory_x_batches, memory_y_batches = [], []
+                    for memory_x, memory_y in memory_loader:
+                        memory_x_batches.append(memory_x)
+                        memory_y_batches.append(memory_y)
+                    stage_x = torch.cat(memory_x_batches, dim=0)
+                    stage_y = torch.cat(memory_y_batches, dim=0)
+                    bi_diag = c.replay.add_domain_batch(
+                        stage_x, stage_y, stage_id=domain_id, model=c.model
+                    )
+                    round_memory_admissions += int(stage_y.numel())
+                    round_bi_scoring_seconds += float(bi_diag["score_seconds"])
+                    round_bi_scored_candidates += int(bi_diag["scored_candidates"])
+                    round_bi_samples_offered += int(bi_diag["incoming"])
+                    print(
+                        f"[BI memory] client={c.cid} stage={domain_id} "
+                        f"incoming={bi_diag['incoming']} candidates={bi_diag['candidates']} "
+                        f"scored={bi_diag['scored_candidates']} kept={bi_diag['kept']} "
+                        f"score_time={bi_diag['score_seconds']:.2f}s",
+                        flush=True,
+                    )
+                else:
+                    for memory_x, memory_y in memory_loader:
+                        c.replay.add_batch(memory_x, memory_y)
+                        round_memory_admissions += int(memory_y.numel())
 
         round_optimizer_steps = (
             sum(c._optimizer_step for c in clients) - round_optimizer_steps_before
@@ -2345,6 +2397,13 @@ def main():
                 round_current_presentations + round_replay_presentations
             ),
             "memory_admissions": int(round_memory_admissions),
+            "bi_memory_scoring_seconds": float(round_bi_scoring_seconds),
+            "bi_scored_candidates": int(round_bi_scored_candidates),
+            "bi_samples_offered_once": int(round_bi_samples_offered),
+            "bi_memory_stage_ids_by_client": json.dumps(
+                {str(c.cid): list(getattr(c.replay, "stage_ids", ())) for c in clients},
+                sort_keys=True,
+            ),
             "replay_buffer_items": int(sum(len(c.replay.data) for c in clients)),
             "controller_calls": int(controller_calls),
             "controller_calls_cum": int(controller_calls_cum),
