@@ -29,7 +29,9 @@ class Client:
         self.optimizer = optimizer
         self.criterion = nn.CrossEntropyLoss()
         self.loader = train_loader
-        self.replay = replay or ReplayBuffer(capacity=2000)
+        # Empty memory implementations may define __len__ and therefore be falsey.
+        # Preserve any explicitly supplied buffer; fall back only for None.
+        self.replay = replay if replay is not None else ReplayBuffer(capacity=2000)
         self.val_loader = val_loader
         self.early_patience = early_patience
         self.gradient_monitor = gradient_monitor
