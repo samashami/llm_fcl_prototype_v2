@@ -2,6 +2,9 @@ import unittest
 
 import torch
 from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from src.fl import Client
 
 from src.policy.bi_memory import BIMemory, IMAGENET_MEAN, IMAGENET_STD
 
@@ -22,6 +25,24 @@ class BIMemoryTests(unittest.TestCase):
         mean = torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
         std = torch.tensor(IMAGENET_STD).view(1, 3, 1, 1)
         return (raw - mean) / std
+
+    def test_client_preserves_an_empty_bi_memory_instance(self):
+        model = TinyImageClassifier()
+        memory = BIMemory(capacity=4, seed=3)
+        loader = DataLoader(
+            TensorDataset(self.images(2), torch.tensor([0, 1])),
+            batch_size=2,
+        )
+        client = Client(
+            0,
+            model,
+            torch.optim.SGD(model.parameters(), lr=0.01),
+            loader,
+            device=torch.device("cpu"),
+            replay=memory,
+        )
+        self.assertIs(client.replay, memory)
+        self.assertTrue(hasattr(client.replay, "add_domain_batch"))
 
     def test_bottomk_update_is_capacity_bounded_and_class_balanced(self):
         memory = BIMemory(capacity=4, seed=3, score_batch_size=4)
