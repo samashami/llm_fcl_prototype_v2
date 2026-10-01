@@ -51,6 +51,10 @@ class BIMemory:
     def labels(self):
         return [int(row[1]) for row in self.data]
 
+    @property
+    def class_counts(self):
+        return dict(sorted(Counter(self.labels).items()))
+
     def sample_count_excluding_stage(self, count: int, device, exclude_stage: int):
         candidates = [row for row in self.data if int(row[2]) != int(exclude_stage)]
         k = min(max(0, int(count)), len(candidates))
@@ -77,7 +81,8 @@ class BIMemory:
             cy, cx = np.random.randint(height), np.random.randint(width)
             y0, y1 = max(0, cy - length // 2), min(height, cy + length // 2)
             x0, x1 = max(0, cx - length // 2), min(width, cx + length // 2)
-            out[i, :, y0:y1, x0:x1] = 0.0
+            fill = out.new_tensor(IMAGENET_MEAN).view(3, 1, 1)
+            out[i, :, y0:y1, x0:x1] = fill
         return out
 
     @classmethod
@@ -90,8 +95,8 @@ class BIMemory:
         return [
             cls._cutout(images, 10),
             cls._cutout(images, 20),
-            v2.RandomHorizontalFlip(p=1.0)(images),
-            v2.RandomVerticalFlip(p=1.0)(images),
+            v2.RandomHorizontalFlip()(images),
+            v2.RandomVerticalFlip()(images),
             v2.RandomRotation(degrees=10)(images),
             v2.RandomRotation(degrees=45)(images),
             v2.RandomRotation(degrees=90)(images),
@@ -99,7 +104,7 @@ class BIMemory:
             v2.RandomPerspective()(images),
             v2.RandomAffine(degrees=20, translate=(0.1, 0.3), scale=(0.5, 0.75))(images),
             crop(images),
-            v2.RandomInvert(p=1.0)(images),
+            v2.RandomInvert()(images),
         ]
 
     @torch.no_grad()
@@ -120,7 +125,7 @@ class BIMemory:
             with torch.random.fork_rng(devices=devices):
                 torch.manual_seed(1729 + len(self._admitted_stages))
                 if device.type == "cuda":
-                    torch.cuda.manual_seed_all(1729 + len(self._admitted_stages))
+                    torch.cuda.manual_seed(1729 + len(self._admitted_stages))
                 np.random.seed(1729 + len(self._admitted_stages))
                 for offset in range(0, images.shape[0], self.score_batch_size):
                     normalized = images[offset:offset + self.score_batch_size].to(device)
