@@ -113,6 +113,7 @@ class Client:
         shrinkage_factors=None,
         round_id: int = 0,
         fixed_batch_budget: bool = False,
+        active_stage_id: Optional[int] = None,
     ):
         self.model.train()
         num_batches = len(self.loader)
@@ -130,7 +131,12 @@ class Client:
             # optional replay
             if self.replay is not None and replay_ratio > 0.0:
                 requested_replay = int(x.size(0) * replay_ratio)
-                rx, ry = self.replay.sample_count(requested_replay, device=self.device)
+                if active_stage_id is not None and hasattr(self.replay, "sample_count_excluding_stage"):
+                    rx, ry = self.replay.sample_count_excluding_stage(
+                        requested_replay, device=self.device, exclude_stage=active_stage_id
+                    )
+                else:
+                    rx, ry = self.replay.sample_count(requested_replay, device=self.device)
                 if rx is not None:
                     rx = rx.to(self.device, non_blocking=True)
                     ry = ry.to(self.device, non_blocking=True)
