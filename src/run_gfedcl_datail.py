@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
-"""Run the official GFedCL CIFAR implementation on our frozen Data-IL stream.
-
-The script pins the upstream GFedCL source, injects our dataset adapter, and
-keeps GFedCL's graph/discriminator/synthetic-replay mechanism intact.  The full
-paper run uses seven held-out domains and two rounds per stage with a 3+2 local
-epoch schedule for current-stage training.  GFedCL's synthetic previous-stage
-pass remains additional method-specific compute and must be reported as such.
-"""
+"""Run official GFedCL on the paper's frozen controlled Data-IL stream."""
 from __future__ import annotations
 
 import argparse
 import csv
 import json
 import logging
-import os
 from pathlib import Path
 import random
 import shutil
@@ -43,6 +35,8 @@ def ensure_upstream(root: Path, refresh: bool) -> Path:
         _run(["git", "clone", UPSTREAM_URL, root])
     _run(["git", "fetch", "origin", UPSTREAM_COMMIT], cwd=root)
     _run(["git", "checkout", "--detach", UPSTREAM_COMMIT], cwd=root)
+    _run(["git", "reset", "--hard", UPSTREAM_COMMIT], cwd=root)
+    _run(["git", "clean", "-fd"], cwd=root)
     return root
 
 
@@ -81,11 +75,10 @@ def configure_opt(upstream_root: Path, args):
         opt.device = "cpu"
     if opt.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA requested but unavailable")
-
     opt.seed = int(args.seed)
     opt.num_clients = 4
     opt.num_task = 7
-    opt.class_per_task = 100  # shared-label Data-IL; only informational upstream
+    opt.class_per_task = 100
     opt.num_classes = 100
     opt.nc = 100
     opt.batch_size = int(args.batch_size)
@@ -100,14 +93,10 @@ def configure_opt(upstream_root: Path, args):
     opt.log_path = str(Path(opt.output_dir) / "run.log")
     opt.use_graph = True
     opt.use_temporal = True
-    # Preserve GFedCL method-specific optimizer/privacy defaults from upstream.
     return opt
 
 
 def inject_dataset_adapter(opt, args):
-    # gfedcl.py imports utils.evaluation_utils at module load, then imports
-    # utils.dataset_utils lazily in ParallelServerGFedCL.__init__.  Install only
-    # the dataset submodule so all other upstream utilities remain untouched.
     import utils  # noqa: F401
     module = types.ModuleType("utils.dataset_utils")
     module.setup_cifar100_loaders = make_upstream_loader_factory(
@@ -143,8 +132,8 @@ def write_manifest(opt, args):
             "and, after stage 0, performs its upstream synthetic previous-stage pass."
         ),
         "architecture": (
-            "Upstream GFedCL CIFAR architecture at 32x32 is retained; this comparator matches "
-            "the data stream and stage schedule but not the LMSS ImageNet-pretrained backbone."
+            "Upstream GFedCL CIFAR architecture at 32x32 is retained; data stream and stage "
+            "schedule are matched, but the LMSS ImageNet-pretrained backbone is not substituted."
         ),
     }
     (path / "gfedcl_datail_manifest.json").write_text(json.dumps(payload, indent=2))
@@ -153,27 +142,26 @@ def write_manifest(opt, args):
 def postprocess_primary(output_dir: Path):
     src = output_dir / "all_tasks_accuracy.csv"
     if not src.exists():
-        return
+        raise RuntimeError(f"missing expected GFedCL output: {src}")
     rows = []
     with src.open(newline="") as f:
         for row in csv.DictReader(f):
             current = int(row["Current Task"])
-            values = []
+            vals = []
             for task in range(1, current + 1):
                 raw = row.get(f"Task {task} Accuracy", "")
                 if raw != "":
-                    values.append(float(raw))
-            seen = float(np.mean(values)) if values else float("nan")
+                    vals.append(float(raw))
             rows.append({
                 "round": row["Round"],
                 "current_stage": current,
-                "seen_domain_accuracy": seen,
+                "seen_domain_accuracy": float(np.mean(vals)) if vals else float("nan"),
             })
     with (output_dir / "datail_seen_domain_accuracy.csv").open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
-    post_stage0 = [r["seen_domain_accuracy"] for r in rows if int(r["current_stage"]) > 1]
+    post_stage0 = [r["seen_domain_accuracy"] for r in rows if r["current_stage"] > 1]
     summary = {
         "round_averaged_seen_domain_accuracy_post_stage0": float(np.mean(post_stage0)),
         "num_post_stage0_rounds": len(post_stage0),
@@ -194,7 +182,6 @@ def parse_args():
     ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--domain-order", default="heldout", choices=["development", "heldout"])
     args = ap.parse_args()
-
     if args.smoke:
         args.val_size = 700
         args.subset_per_client = 140
@@ -233,7 +220,6 @@ def main():
         handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler(opt.log_path)],
     )
     from gfedcl import ParallelServerGFedCL
-
     trainer = ParallelServerGFedCL(opt)
     trainer.train_GFedCL()
     postprocess_primary(Path(opt.output_dir))
