@@ -136,6 +136,12 @@ def make_upstream_loader_factory(
         test_indices = list(range(len(state["test_full"])))
         workers = int(getattr(opt, "num_workers", 0))
         pin = bool(getattr(opt, "pin_memory", False))
+        # Upstream GFedCL's server-discriminator code assumes all training
+        # minibatches contributing encodings have equal size.  The paper smoke
+        # subset intentionally creates short final minibatches, so drop only
+        # those incomplete smoke minibatches.  Full paper runs leave every
+        # sample intact and require a separate upstream batching fix before use.
+        smoke_drop_last = int(subset_per_client) > 0
         for cid in range(int(opt.num_clients)):
             for stage in range(7):
                 domain = int(state["domain_order"][stage])
@@ -151,6 +157,7 @@ def make_upstream_loader_factory(
                     "train": DataLoader(
                         train_ds, batch_size=int(opt.batch_size), shuffle=True,
                         num_workers=workers, pin_memory=pin,
+                        drop_last=smoke_drop_last,
                     ),
                     "test": DataLoader(
                         test_ds, batch_size=int(opt.batch_size), shuffle=False,
@@ -178,6 +185,7 @@ def make_upstream_loader_factory(
                     for schedule in state["schedules"]
                 ],
                 "per_stage_class_counts_by_client": state["class_counts"],
+                "smoke_drop_last": bool(smoke_drop_last),
                 "architecture_note": (
                     "Upstream GFedCL retains its native 32x32 encoder/generator; "
                     "the data split, client split, domain order and stage allocation are matched."
