@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import logging
+import os
 from pathlib import Path
 import random
 import shutil
@@ -66,7 +67,25 @@ def patch_upstream(gfedcl_py: Path, classifier_epochs: int) -> None:
 
 def configure_opt(upstream_root: Path, args):
     cifar_dir = upstream_root / "CIFAR100"
-    sys.path.insert(0, str(cifar_dir))
+    cifar_path = str(cifar_dir.resolve())
+    repo_root = str(Path.cwd().resolve())
+
+    # Ray workers are separate Python processes. They inherit environment
+    # variables present when Ray starts, but not the driver's sys.path edits.
+    # Expose both the pinned upstream CIFAR package (for top-level imports such
+    # as `model`) and this repository (for our Data-IL adapter classes) before
+    # importing gfedcl.py, whose module import starts Ray.
+    existing = os.environ.get("PYTHONPATH", "")
+    entries = [cifar_path, repo_root]
+    if existing:
+        entries.append(existing)
+    os.environ["PYTHONPATH"] = os.pathsep.join(entries)
+
+    if cifar_path not in sys.path:
+        sys.path.insert(0, cifar_path)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
     from configs.CIFAR100 import parse_args
 
     opt = parse_args([])
