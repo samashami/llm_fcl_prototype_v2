@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Run a FedProTIP-style external comparator on the frozen CIFAR Data-IL stream.
+"""Run a FedProTIP projection-component comparator on frozen CIFAR Data-IL.
 
-This is a protocol adaptation, not an exact reproduction of the authors' CIFAR
-Class-IL setup.  It preserves the FedProTIP/GPM gradient-projection mechanism
-and replay-free training, while matching this paper's 4-client/7-domain Data-IL
-stream, ImageNet-pretrained ResNet-18, Adam optimizer, and 3+2 local-epoch
-schedule.  The comparator is evaluated without task labels at inference.
+This is an explicit protocol adaptation, not a reproduction of the full
+FedProTIP system. It retains replay-free GPM gradient protection while matching
+this paper's shared-head 4-client/7-domain Data-IL stream, ImageNet-pretrained
+ResNet-18, persistent Adam optimizer, and 3+2 local-epoch schedule. Task-ID
+prediction is omitted because every domain uses the same 100-class output head.
 """
 from __future__ import annotations
 
@@ -24,7 +24,6 @@ from torchvision import datasets
 
 from src.attribution_protocol import block_epoch_budget, resolve_domain_order
 from src.data_il_streams import (
-    CONTROLLED_DOMAIN_TRANSFORMS,
     StageDomainDataset,
     make_controlled_domain_shift_batches,
     stage_class_counts,
@@ -110,7 +109,7 @@ def build_stream(seed, data_dir, val_size, subset_per_client, domain_order_name)
     return train_full, test_full, val_indices, splits, schedules, domain_order
 
 
-def train_epoch(model, optimizer, loader, projector, device):
+def train_epoch(model, optimizer, loader, projector, device, projection_active: bool):
     model.train()
     criterion = torch.nn.CrossEntropyLoss()
     steps = 0
@@ -118,7 +117,11 @@ def train_epoch(model, optimizer, loader, projector, device):
     loss_sum = 0.0
     removed = 0.0
     total_energy = 0.0
+    residual_inside = 0.0
     projected_layers = 0
+    zeroed_1d = 0
+    max_residual_ratio = 0.0
+
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
@@ -126,21 +129,34 @@ def train_epoch(model, optimizer, loader, projector, device):
         logits = model(x)
         loss = criterion(logits, y)
         loss.backward()
-        stats = projector.project_gradients()
+
+        if projection_active:
+            stats = projector.project_gradients()
+            zeroed_1d += projector.zero_backbone_1d_gradients()
+            removed += float(stats["gradient_energy_removed"])
+            total_energy += float(stats["gradient_energy_total"])
+            residual_inside += float(stats["gradient_energy_residual_inside"])
+            max_residual_ratio = max(
+                max_residual_ratio, float(stats["projection_residual_ratio"])
+            )
+            projected_layers = max(projected_layers, int(stats["projected_layers"]))
         optimizer.step()
+
         steps += 1
         samples += int(y.numel())
         loss_sum += float(loss.item())
-        removed += float(stats["gradient_energy_removed"])
-        total_energy += float(stats["gradient_energy_total"])
-        projected_layers = max(projected_layers, int(stats["projected_layers"]))
+
     return {
         "loss": loss_sum / max(1, steps),
         "optimizer_steps": int(steps),
         "presentations": int(samples),
+        "projection_active": bool(projection_active),
         "projected_layers": int(projected_layers),
+        "zeroed_backbone_1d_gradients": int(zeroed_1d),
         "gradient_energy_removed": float(removed),
         "gradient_energy_total": float(total_energy),
+        "gradient_energy_residual_inside": float(residual_inside),
+        "max_projection_residual_ratio": float(max_residual_ratio),
     }
 
 
@@ -155,6 +171,7 @@ def parse_args():
     ap.add_argument("--domain-order", choices=["development", "heldout"], default="heldout")
     ap.add_argument("--threshold", type=float, default=0.70)
     ap.add_argument("--gpm-max-batches", type=int, default=20)
+    ap.add_argument("--gpm-activation-microbatch", type=int, default=8)
     args = ap.parse_args()
     if args.smoke:
         args.val_size = 700
@@ -192,7 +209,7 @@ def main():
     test_indices = list(range(len(test_full)))
 
     manifest = {
-        "method": "FedProTIP-style GPM Data-IL adaptation",
+        "method": "FedProTIP projection component adapted to shared-head Data-IL",
         "upstream_repository": UPSTREAM_REPO,
         "upstream_commit": UPSTREAM_COMMIT,
         "seed": int(args.seed),
@@ -205,16 +222,25 @@ def main():
         "block_epoch_budget": [1, 1] if args.smoke else [3, 2],
         "batch_size": int(args.batch_size),
         "optimizer": "Adam",
+        "optimizer_state_policy": (
+            "Persistent per-client Adam state across rounds; global weights are broadcast "
+            "before each local block. Optimizer state is not reset after stage 0. Frozen "
+            "parameters remain in the optimizer but receive no gradients. This intentionally "
+            "matches the controlled study optimizer rather than upstream FedProTIP SGD."
+        ),
         "lr": 1e-4,
         "replay": False,
         "threshold": float(args.threshold),
         "gpm_max_batches": int(args.gpm_max_batches),
+        "gpm_max_columns": 512,
+        "gpm_activation_microbatch": int(args.gpm_activation_microbatch),
         "domain_order_name": args.domain_order,
         "domain_order": [int(x) for x in domain_order],
         "adapter_note": (
-            "FedProTIP's replay-free GPM gradient projection is retained. "
-            "Task-ID prediction/Class-IL head masking is omitted because the controlled Data-IL "
-            "protocol uses a shared 100-class label space in every domain."
+            "This is not full FedProTIP. It retains replay-free GPM gradient projection, "
+            "upstream pretrained-ResNet early-block freezing, and later-task suppression "
+            "of one-dimensional backbone gradients. Task-ID prediction/head masking is "
+            "omitted because the controlled Data-IL protocol uses one shared 100-class head."
         ),
         "stage_sizes_by_client": [[len(stage) for stage in schedule] for schedule in schedules],
         "class_counts_by_client": [
@@ -237,10 +263,15 @@ def main():
     gpm_rows = []
     total_steps = 0
     total_presentations = 0
+    post_stage0_steps = 0
+    post_stage0_presentations = 0
+    frozen_parameter_names = []
 
     round_id = 0
     for stage_position in range(7):
         domain_id = int(domain_order[stage_position])
+        projection_active = stage_position > 0
+
         for block_id in range(2):
             for cid, model in enumerate(clients):
                 model.load_state_dict(global_model.state_dict())
@@ -258,11 +289,7 @@ def main():
                     num_workers=args.num_workers,
                     pin_memory=(device.type == "cuda"),
                 )
-                epochs = (
-                    1
-                    if args.smoke
-                    else block_epoch_budget(args.local_epochs, 2, block_id)
-                )
+                epochs = 1 if args.smoke else block_epoch_budget(args.local_epochs, 2, block_id)
                 for epoch in range(epochs):
                     stats = train_epoch(
                         model,
@@ -270,9 +297,23 @@ def main():
                         loader,
                         projectors[cid],
                         device,
+                        projection_active=projection_active,
                     )
+                    if projection_active:
+                        if shared.bases and stats["projected_layers"] == 0:
+                            raise RuntimeError(
+                                f"projection active at stage {stage_position} but no layer was projected"
+                            )
+                        if stats["max_projection_residual_ratio"] > 1e-8:
+                            raise RuntimeError(
+                                "projected gradient retains excessive protected component: "
+                                f"{stats['max_projection_residual_ratio']:.3e}"
+                            )
                     total_steps += stats["optimizer_steps"]
                     total_presentations += stats["presentations"]
+                    if stage_position > 0:
+                        post_stage0_steps += stats["optimizer_steps"]
+                        post_stage0_presentations += stats["presentations"]
                     local_rows.append({
                         "round": round_id,
                         "stage": stage_position,
@@ -324,9 +365,28 @@ def main():
             )
             round_id += 1
 
-        # FedProTIP/GPM updates its protected representation subspace after
-        # completing a continual stage.  Use each client's stage data and the
-        # common global model as the starting point for consistent bases.
+        # Upstream freezes the pretrained ResNet stem/layer1/layer2 immediately
+        # after task 0, before collecting the first protected representations.
+        if stage_position == 0:
+            per_client_frozen = []
+            for projector in projectors:
+                names = projector.freeze_early_blocks()
+                per_client_frozen.append(names)
+            if not per_client_frozen or any(names != per_client_frozen[0] for names in per_client_frozen):
+                raise RuntimeError("inconsistent FedProTIP frozen parameter sets across clients")
+            frozen_parameter_names = per_client_frozen[0]
+            if not frozen_parameter_names:
+                raise RuntimeError("FedProTIP early-block freezing selected no parameters")
+            print(
+                f"[FedProTIP] froze {len(frozen_parameter_names)} early-backbone parameters "
+                "after stage 0; persistent Adam state retained",
+                flush=True,
+            )
+
+        # Update the protected representation basis after each completed stage.
+        # Frozen layers are excluded automatically because their weights no longer
+        # require gradients. A shared basis is updated sequentially across clients,
+        # matching the upstream global orthogonal-set semantics.
         for cid, model in enumerate(clients):
             model.load_state_dict(global_model.state_dict())
             projectors[cid].model = model
@@ -350,26 +410,35 @@ def main():
                 client_id=cid,
                 device=device,
                 max_batches=args.gpm_max_batches,
+                activation_microbatch=args.gpm_activation_microbatch,
             )
+            if record["max_orthogonality_error"] > 1e-5:
+                raise RuntimeError(
+                    "GPM basis failed orthonormality check: "
+                    f"{record['max_orthogonality_error']:.3e}"
+                )
             gpm_rows.append({
                 "stage": record["stage"],
                 "client": record["client"],
                 "threshold": record["threshold"],
                 "updated_layers": record["updated_layers"],
                 "seconds": record["seconds"],
+                "max_orthogonality_error": record["max_orthogonality_error"],
                 "ranks_json": json.dumps(record["ranks"], sort_keys=True),
+                "sampled_columns_json": json.dumps(record["sampled_columns"], sort_keys=True),
+                "seen_columns_json": json.dumps(record["seen_columns"], sort_keys=True),
             })
+
         if stage_position == 0:
-            # The official pretrained-ResNet FedProTIP freezes early blocks
-            # after the first task. Preserve that behavior for later stages.
-            for model in clients:
-                projector = FedProTIPProjector(model, shared, seed=args.seed)
-                projector.freeze_early_blocks()
-            # Rebuild optimizers so frozen parameters are excluded cleanly.
-            optimizers = [
-                optim.Adam((p for p in model.parameters() if p.requires_grad), lr=1e-4, weight_decay=0.0)
-                for model in clients
-            ]
+            nonzero_bases = {
+                name: basis for name, basis in shared.bases.items() if basis.size > 0
+            }
+            if not nonzero_bases:
+                raise RuntimeError("stage-0 GPM construction produced no protected bases")
+            print(
+                f"[FedProTIP] stage-0 basis ready for {len(nonzero_bases)} trainable conv layers",
+                flush=True,
+            )
 
     for filename, rows in (
         ("fedprotip_round_metrics.csv", round_rows),
@@ -387,10 +456,25 @@ def main():
         "round_averaged_seen_domain_accuracy_post_stage0": float(np.mean(post_stage0)),
         "final_seen_domain_accuracy": float(final["seen_domain_accuracy"]),
         "final_current_domain_accuracy": float(final["current_domain_accuracy"]),
-        "optimizer_steps": int(total_steps),
-        "example_presentations": int(total_presentations),
+        "optimizer_steps_total": int(total_steps),
+        "example_presentations_total": int(total_presentations),
+        "optimizer_steps_post_stage0": int(post_stage0_steps),
+        "example_presentations_post_stage0": int(post_stage0_presentations),
         "gpm_update_seconds": float(shared.update_seconds),
         "gpm_basis_ranks": {key: int(value.shape[1]) for key, value in shared.bases.items()},
+        "frozen_parameter_names": frozen_parameter_names,
+        "max_gpm_orthogonality_error": float(
+            max(
+                (row["max_orthogonality_error"] for row in gpm_rows),
+                default=0.0,
+            )
+        ),
+        "max_projection_residual_ratio": float(
+            max(
+                (row["max_projection_residual_ratio"] for row in local_rows),
+                default=0.0,
+            )
+        ),
     }
     (output_dir / "fedprotip_summary.json").write_text(json.dumps(summary, indent=2))
     print("[FedProTIP Data-IL] summary:", summary, flush=True)
