@@ -50,12 +50,7 @@ class FedProTIPProjector:
         return f"{module_name}.weight"
 
     def freeze_early_blocks(self) -> list[str]:
-        """Mirror upstream pretrained-ResNet freezing through layer2.
-
-        Upstream freezes the first 30 backbone parameters, corresponding to the
-        torchvision ResNet-18 stem, layer1 and layer2. Explicit prefixes are used
-        here so the rule is auditable and independent of parameter enumeration.
-        """
+        """Mirror upstream pretrained-ResNet freezing through layer2."""
         frozen = []
         for name, param in self.model.named_parameters():
             if name.startswith(self.EARLY_FROZEN_PREFIXES):
@@ -63,22 +58,36 @@ class FedProTIPProjector:
                 frozen.append(name)
         return frozen
 
-    def zero_backbone_1d_gradients(self) -> int:
-        """Preserve upstream later-task handling of 1-D backbone parameters.
+    def protected_backbone_1d_parameters(self) -> dict[str, nn.Parameter]:
+        """Return later-stage 1-D backbone parameters protected by FedProTIP.
 
-        FedProTIP zeroes gradients of one-dimensional backbone parameters during
-        projected training. For ResNet-18 these are primarily BatchNorm affine
-        parameters. Running statistics remain governed by normal train/eval mode.
-        The classifier head is intentionally excluded.
+        The classifier is excluded. Frozen parameters are already protected by
+        ``requires_grad=False`` and therefore are not included here.
         """
-        zeroed = 0
-        for name, param in self.model.named_parameters():
-            if name.startswith("fc.") or not param.requires_grad:
-                continue
-            if param.grad is not None and param.ndim == 1:
-                param.grad.zero_()
-                zeroed += 1
-        return zeroed
+        return {
+            name: param
+            for name, param in self.model.named_parameters()
+            if not name.startswith("fc.") and param.requires_grad and param.ndim == 1
+        }
+
+    def suppress_backbone_1d_gradients(self) -> int:
+        """Set protected 1-D backbone gradients to None before Adam.step().
+
+        Upstream FedProTIP zeroes these gradients under freshly-created SGD. With
+        persistent Adam, a zero tensor could still permit stored momentum to
+        update the parameter. ``grad=None`` makes Adam skip the parameter while
+        leaving BatchNorm running-statistic behaviour governed by train/eval mode.
+        """
+        suppressed = 0
+        for _name, param in self.protected_backbone_1d_parameters().items():
+            if param.grad is not None:
+                param.grad = None
+                suppressed += 1
+        return suppressed
+
+    # Backward-compatible name used by older smoke logs/runner revisions.
+    def zero_backbone_1d_gradients(self) -> int:
+        return self.suppress_backbone_1d_gradients()
 
     def project_gradients(self) -> dict:
         """Apply G <- G - G U U^T to protected convolutional gradients."""
@@ -176,11 +185,11 @@ class FedProTIPProjector:
     ) -> dict:
         """Update shared GPM bases from convolution inputs.
 
-        Representation columns are sampled uniformly across all observed batches
-        with a 512-column reservoir, matching the upstream cap without favouring
-        later batches. Hooks unfold at most ``activation_microbatch`` examples at
-        once, so a training-size loader batch of 256 does not materialize the full
-        high-resolution patch matrix.
+        Every example in each selected loader batch is processed. Loader batches
+        are forwarded in ``activation_microbatch`` chunks solely to bound the
+        temporary unfold tensor. Representation columns from all chunks enter one
+        uniform 512-column reservoir, matching the upstream sampling cap without
+        favouring later batches or silently discarding examples.
         """
         started = time.perf_counter()
         rng = np.random.RandomState(self.seed + 1009 * int(stage) + 97 * int(client_id))
@@ -188,6 +197,11 @@ class FedProTIPProjector:
         seen_columns: dict[str, int] = {}
         handles = []
         named_params = dict(self.model.named_parameters())
+        processed_examples = 0
+        processed_loader_batches = 0
+
+        if int(activation_microbatch) <= 0:
+            raise ValueError("activation_microbatch must be positive")
 
         def make_hook(module_name: str, module: nn.Conv2d):
             weight_name = self._weight_name(module_name)
@@ -197,11 +211,6 @@ class FedProTIPProjector:
                 if param is None or not param.requires_grad:
                     return
                 x = inputs[0].detach()
-                if x.shape[0] > int(activation_microbatch):
-                    selected_examples = rng.choice(
-                        x.shape[0], int(activation_microbatch), replace=False
-                    )
-                    x = x[selected_examples]
                 patches = F.unfold(
                     x,
                     kernel_size=module.kernel_size,
@@ -236,7 +245,13 @@ class FedProTIPProjector:
                 for batch_index, (x, _y) in enumerate(loader):
                     if batch_index >= int(max_batches):
                         break
-                    self.model(x.to(device, non_blocking=True))
+                    processed_loader_batches += 1
+                    for start in range(0, int(x.shape[0]), int(activation_microbatch)):
+                        chunk = x[start : start + int(activation_microbatch)]
+                        if chunk.numel() == 0:
+                            continue
+                        processed_examples += int(chunk.shape[0])
+                        self.model(chunk.to(device, non_blocking=True))
         finally:
             for handle in handles:
                 handle.remove()
@@ -309,6 +324,8 @@ class FedProTIPProjector:
                 name: int(value.shape[1]) for name, value in columns.items()
             },
             "seen_columns": {name: int(value) for name, value in seen_columns.items()},
+            "processed_examples": int(processed_examples),
+            "processed_loader_batches": int(processed_loader_batches),
             "seconds": elapsed,
         }
         self.shared.history.append(record)
