@@ -1951,6 +1951,9 @@ def main():
                 ],
             }
             is_highlr = args.controller == "fixed_highlr"
+            # Keep the requested LR in the validated action so the attribution
+            # axis restriction does not silently restore the baseline LR.
+            candidate["lr"] = 1.5e-4 if is_highlr else float(args.lr)
             action = validate_action(
                 candidate,
                 n_clients=len(clients),
