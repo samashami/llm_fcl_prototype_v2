@@ -16,6 +16,15 @@ from src.attribution_protocol import (
 
 
 class AttributionProtocolTests(unittest.TestCase):
+    def test_fixed_highlr_configuration_is_isolated(self):
+        from pathlib import Path
+        source = Path("src/run_llm_fcl_controller.py").read_text(encoding="utf-8")
+        self.assertIn('args.controller == "fixed_highlr" and not args.attribution_protocol', source)
+        self.assertIn('args.controller in {"fixed", "fixed_highlr"}', source)
+        self.assertIn('hp_lr = 1.5e-4', source)
+        self.assertIn('if args.attribution_protocol and stage_position == 0:', source)
+        self.assertIn('fixed_lr=args.lr', source)
+
     def test_two_blocks_map_to_one_stage(self):
         self.assertEqual(stage_and_block(0, 2), (0, 0))
         self.assertEqual(stage_and_block(1, 2), (0, 1))
