@@ -640,7 +640,7 @@ def main():
                 f"{config_mismatches}"
             )
         if args.attribution_smoke and (
-            args.controller != "fixed"
+            args.controller not in {"fixed", "fixed_highlr"}
             or args.control_mode != "joint"
             or args.domain_order != "development"
             or args.evaluation_source != "validation"
