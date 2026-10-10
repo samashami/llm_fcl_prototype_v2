@@ -490,7 +490,7 @@ def main():
     ap.add_argument(
         "--controller",
         choices=[
-            "v4", "rules_joint", "mock", "fixed", "frozen_lmss", "sft", "lmss_api",
+            "v4", "rules_joint", "mock", "fixed", "fixed_highlr", "frozen_lmss", "sft", "lmss_api",
             "lmss_local", "lmss_openrouter",
         ],
         default="v4",
@@ -590,11 +590,11 @@ def main():
         if args.epochs < args.blocks_per_stage:
             ap.error("--epochs must allow at least one epoch per control block")
         allowed_controllers = {
-            "fixed", "frozen_lmss", "lmss_openrouter", "rules_joint"
+            "fixed", "fixed_highlr", "frozen_lmss", "lmss_openrouter", "rules_joint"
         }
         if args.controller not in allowed_controllers:
             ap.error(
-                "--attribution_protocol supports only fixed, frozen_lmss, "
+                "--attribution_protocol supports only fixed, fixed_highlr, frozen_lmss, "
                 "lmss_openrouter, and rules_joint"
             )
         if args.controller != "lmss_openrouter" and args.control_mode != "joint":
@@ -658,6 +658,8 @@ def main():
             )
     elif args.blocks_per_stage != 1:
         ap.error("--blocks_per_stage other than 1 requires --attribution_protocol")
+    if args.controller == "fixed_highlr" and not args.attribution_protocol:
+        ap.error("--controller fixed_highlr requires --attribution_protocol")
     if args.attribution_smoke and not args.attribution_protocol:
         ap.error("--attribution_smoke requires --attribution_protocol")
     if args.controller == "frozen_lmss" and not args.frozen_action_schedule:
@@ -1938,8 +1940,8 @@ def main():
             hp_lr = float(lr)
             hp_notes = " | ".join(notes)
             
-        elif args.controller == "fixed":
-            # fixed (paper CL defaults)
+        elif args.controller in {"fixed", "fixed_highlr"}:
+            # Follow-up control: same fixed replay, but higher LR only after stage 0.
             candidate = {
                 "client_selection_k": len(clients),
                 "aggregation": {"method": "FedAvg"},
@@ -1948,10 +1950,22 @@ def main():
                     for c in clients
                 ],
             }
-            action = validate_action(candidate, n_clients=len(clients), policy_source="Fixed")
-            hp_lr = float(args.lr)
+            is_highlr = args.controller == "fixed_highlr"
+            action = validate_action(
+                candidate,
+                n_clients=len(clients),
+                policy_source="FixedHighLR" if is_highlr else "Fixed",
+            )
+            if is_highlr:
+                # Stage 0 is handled above at the original 1e-4.
+                # Do not change --lr: it is part of the frozen protocol and
+                # shared stage-0 checkpoint provenance.
+                hp_lr = 1.5e-4
+                hp_notes = "fixed post-stage-0 LR 1.5e-4 (follow-up control)"
+            else:
+                hp_lr = float(args.lr)
+                hp_notes = "fixed (paper CL default)"
             rep = 0.50
-            hp_notes = "fixed (paper CL default)"
         elif args.controller == "frozen_lmss":
             raw = copy.deepcopy(frozen_actions[r])
             raw.pop("controller_metadata", None)
